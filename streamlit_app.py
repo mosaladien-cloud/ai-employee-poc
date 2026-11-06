@@ -7,7 +7,7 @@ from urllib.parse import urlencode, quote
 import streamlit as st
 
 # ==========================================
-# APP CONFIGURATION
+# APP SETTINGS
 # ==========================================
 
 st.set_page_config(
@@ -16,15 +16,15 @@ st.set_page_config(
     layout="centered",
 )
 
-# PRIVATE SINGLE-USER TEST ONLY
-# Do not invite customers until login and
-# per-user authorization are implemented.
+# Private single-user prototype only.
+# Add real authentication before allowing customers.
 TEST_USER_ID = "ai-employee-poc-owner"
 
 APP_URL = "https://ai-employee-poc.streamlit.app"
-API_BASE = "https://backend.composio.dev/api/v3.1"
+COMPOSIO_BASE = "https://backend.composio.dev/api/v3.1"
 
-# Google Ads has been removed from the UI.
+GEMINI_MODEL = "gemini-3.5-flash-lite"
+
 APPS = {
     "Google Analytics": {
         "toolkit": "google_analytics",
@@ -38,19 +38,14 @@ APPS = {
 
 
 # ==========================================
-# COMPOSIO API CLIENT
+# COMPOSIO API
 # ==========================================
 
 def api_request(path, method="GET", body=None, query=None):
-    url = API_BASE + path
+    url = COMPOSIO_BASE + path
 
     if query:
         url += "?" + urlencode(query, doseq=True)
-
-    headers = {
-        "x-api-key": st.secrets["COMPOSIO_API_KEY"],
-        "Content-Type": "application/json",
-    }
 
     payload = (
         json.dumps(body).encode("utf-8")
@@ -61,7 +56,10 @@ def api_request(path, method="GET", body=None, query=None):
     request = urllib.request.Request(
         url,
         data=payload,
-        headers=headers,
+        headers={
+            "x-api-key": st.secrets["COMPOSIO_API_KEY"],
+            "Content-Type": "application/json",
+        },
         method=method,
     )
 
@@ -70,18 +68,11 @@ def api_request(path, method="GET", body=None, query=None):
             request, timeout=45
         ) as response:
             raw = response.read()
-
-            if not raw:
-                return {"success": True}
-
-            return json.loads(raw.decode("utf-8"))
+            return json.loads(raw) if raw else {"success": True}
 
     except HTTPError as error:
         try:
-            details = json.loads(
-                error.read().decode("utf-8")
-            )
-
+            details = json.loads(error.read().decode("utf-8"))
             info = details.get("error", {})
 
             if isinstance(info, dict):
@@ -94,7 +85,7 @@ def api_request(path, method="GET", body=None, query=None):
                 message = str(info)
 
         except (ValueError, UnicodeDecodeError):
-            message = "No readable error details"
+            message = "No readable error details."
 
         raise RuntimeError(
             f"Composio HTTP {error.code}: {message}"
@@ -102,12 +93,12 @@ def api_request(path, method="GET", body=None, query=None):
 
     except (URLError, TimeoutError):
         raise RuntimeError(
-            "Network error while contacting Composio"
+            "Network error while contacting Composio."
         ) from None
 
 
 # ==========================================
-# CONNECTED ACCOUNT MANAGEMENT
+# CONNECTED ACCOUNTS
 # ==========================================
 
 def get_connections(toolkit):
@@ -143,7 +134,6 @@ def get_connections(toolkit):
                 connections.append(account)
 
         cursor = result.get("next_cursor")
-
         if not cursor:
             break
 
@@ -165,15 +155,13 @@ def create_connect_link(auth_config_id):
 
     if not url or not url.startswith("https://"):
         raise RuntimeError(
-            "Composio did not return a valid authorization URL."
+            "Composio did not return an authorization URL."
         )
 
     return url
 
 
 def disconnect_account(connection_id, toolkit):
-    # Verify ownership on the server immediately
-    # before deleting the connected account.
     account = api_request(
         "/connected_accounts/"
         + quote(connection_id, safe="")
@@ -207,23 +195,21 @@ def disconnect_account(connection_id, toolkit):
 
 
 def clear_ga4_state():
-    keys = [
+    for key in [
         "ga4_properties",
         "ga4_selected",
         "approved_ga4_properties",
         "ga4_property_connection",
-    ]
-
-    for key in keys:
+    ]:
         st.session_state.pop(key, None)
 
 
 # ==========================================
-# GOOGLE ANALYTICS PROPERTY SELECTION
+# GOOGLE ANALYTICS
 # ==========================================
 
 def unwrap_data(value):
-    for _ in range(4):
+    for _ in range(5):
         if not isinstance(value, dict):
             break
 
@@ -268,10 +254,10 @@ def load_ga4_properties(connection_id):
     page_token = ""
 
     for _ in range(10):
-        args = {"pageSize": 200}
+        arguments = {"pageSize": 200}
 
         if page_token:
-            args["pageToken"] = page_token
+            arguments["pageToken"] = page_token
 
         result = api_request(
             "/tool_router/session/"
@@ -281,7 +267,7 @@ def load_ga4_properties(connection_id):
             body={
                 "tool_slug":
                     "GOOGLE_ANALYTICS_LIST_ACCOUNT_SUMMARIES",
-                "arguments": args,
+                "arguments": arguments,
             },
         )
 
@@ -289,17 +275,15 @@ def load_ga4_properties(connection_id):
             raise RuntimeError(
                 str(
                     result.get("error")
-                    or "Failed to load GA4 properties."
+                    or "Unable to load GA4 properties."
                 )
             )
 
-        data = unwrap_data(
-            result.get("data", {})
-        )
+        data = unwrap_data(result.get("data", {}))
 
         if not isinstance(data, dict):
             raise RuntimeError(
-                "Unexpected Google Analytics response."
+                "Unexpected GA4 response format."
             )
 
         if data.get("successful") is False:
@@ -310,16 +294,12 @@ def load_ga4_properties(connection_id):
                 )
             )
 
-        for account in data.get(
-            "accountSummaries", []
-        ):
+        for account in data.get("accountSummaries", []):
             account_name = account.get(
                 "displayName", "Unnamed account"
             )
 
-            for prop in account.get(
-                "propertySummaries", []
-            ):
+            for prop in account.get("propertySummaries", []):
                 resource = prop.get("property", "")
                 property_id = resource.split("/")[-1]
 
@@ -341,15 +321,143 @@ def load_ga4_properties(connection_id):
 
 
 # ==========================================
+# GEMINI AI
+# ==========================================
+
+def ask_gemini(messages):
+    url = (
+        "https://generativelanguage.googleapis.com/"
+        f"v1beta/models/{GEMINI_MODEL}:generateContent"
+    )
+
+    contents = []
+
+    for message in messages[-12:]:
+        role = (
+            "model"
+            if message["role"] == "assistant"
+            else "user"
+        )
+
+        contents.append({
+            "role": role,
+            "parts": [
+                {"text": message["content"]}
+            ],
+        })
+
+    system_prompt = """
+You are AI Employee, an intelligent business and
+data analytics assistant.
+
+Your responsibilities:
+- Help users understand marketing and business data.
+- Explain KPIs and performance trends.
+- Provide useful business analysis.
+- Communicate naturally and professionally.
+- Never invent data, numbers, or API results.
+
+Important:
+Live data tool calling is NOT enabled in this chat yet.
+You cannot currently retrieve GA4 or HubSpot metrics.
+
+If a user asks for actual data from a connected
+account, explain that live data access is not
+enabled yet. Do not claim to have queried it.
+
+Respond in the same language the user uses.
+"""
+
+    payload = {
+        "systemInstruction": {
+            "parts": [
+                {"text": system_prompt}
+            ]
+        },
+        "contents": contents,
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 2048,
+        },
+    }
+
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": st.secrets["GOOGLE_API_KEY"],
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(
+            request, timeout=90
+        ) as response:
+            result = json.load(response)
+
+        candidates = result.get("candidates", [])
+
+        if not candidates:
+            raise RuntimeError(
+                "Gemini did not return any response."
+            )
+
+        parts = candidates[0].get(
+            "content", {}
+        ).get("parts", [])
+
+        answer = "\n".join(
+            part["text"]
+            for part in parts
+            if isinstance(part, dict)
+            and "text" in part
+        ).strip()
+
+        if not answer:
+            raise RuntimeError(
+                "Gemini returned no text."
+            )
+
+        return answer
+
+    except HTTPError as error:
+        try:
+            details = json.loads(
+                error.read().decode("utf-8")
+            )
+
+            message = details.get(
+                "error", {}
+            ).get("message", "Unknown API error")
+
+        except (ValueError, AttributeError):
+            message = "Unknown Gemini API error."
+
+        raise RuntimeError(
+            f"Gemini HTTP {error.code}: {message}"
+        ) from None
+
+    except (URLError, TimeoutError):
+        raise RuntimeError(
+            "Unable to reach Gemini API."
+        ) from None
+
+
+# ==========================================
 # MAIN INTERFACE
 # ==========================================
 
 st.title("🤖 AI Employee")
-st.caption("Your personal AI-powered data assistant")
+
+st.caption(
+    "Your personal AI-powered data assistant"
+)
 
 st.warning(
     "Private testing mode. "
-    "Do not share this app with other customers yet."
+    "Do not share this app with customers yet."
 )
 
 if "connect_links" not in st.session_state:
@@ -381,16 +489,13 @@ with tab_integrations:
 
             try:
                 connections = get_connections(toolkit)
+
             except (RuntimeError, KeyError) as error:
                 st.error(str(error))
                 continue
 
             if toolkit == "google_analytics":
                 ga4_connections = connections
-
-            # ----------------------------------
-            # CONNECTED STATE
-            # ----------------------------------
 
             if connections:
                 st.session_state["connect_links"].pop(
@@ -412,9 +517,8 @@ with tab_integrations:
                         "Disconnect this account"
                     ):
                         st.warning(
-                            "This will remove the connection "
-                            "from Composio. You will need to "
-                            "authorize again to reconnect."
+                            "This removes the connection "
+                            "from Composio."
                         )
 
                         confirmed = st.checkbox(
@@ -439,27 +543,25 @@ with tab_integrations:
                                 st.session_state["notice"] = (
                                     f"{app_name} disconnected."
                                 )
+
                                 st.rerun()
 
                             except RuntimeError as error:
                                 st.error(str(error))
 
-                # GA4 properties button
+                # Google Analytics property selection
                 if toolkit == "google_analytics":
-                    active_connection_ids = {
+                    active_ids = {
                         c["id"] for c in connections
                     }
 
-                    previous_connection = (
-                        st.session_state.get(
-                            "ga4_property_connection"
-                        )
+                    previous_id = st.session_state.get(
+                        "ga4_property_connection"
                     )
 
                     if (
-                        previous_connection is not None
-                        and previous_connection
-                        not in active_connection_ids
+                        previous_id is not None
+                        and previous_id not in active_ids
                     ):
                         clear_ga4_state()
 
@@ -468,9 +570,7 @@ with tab_integrations:
                         key="load_ga4",
                     ):
                         try:
-                            connection_id = (
-                                connections[0]["id"]
-                            )
+                            connection_id = connections[0]["id"]
 
                             with st.spinner(
                                 "Loading GA4 properties..."
@@ -491,10 +591,6 @@ with tab_integrations:
 
                         except (RuntimeError, KeyError) as error:
                             st.error(str(error))
-
-            # ----------------------------------
-            # NOT CONNECTED STATE
-            # ----------------------------------
 
             else:
                 if toolkit == "google_analytics":
@@ -518,10 +614,7 @@ with tab_integrations:
                             "connect_links"
                         ][toolkit] = link
 
-                        st.success(
-                            "Link created! Click the "
-                            "Authorize button below."
-                        )
+                        st.success("Authorization link created.")
 
                     except (RuntimeError, KeyError) as error:
                         st.error(str(error))
@@ -537,21 +630,15 @@ with tab_integrations:
                         type="primary",
                     )
 
-                    st.caption(
-                        "Sign in and approve access. "
-                        "Return here afterward. "
-                        "Links expire after about 10 minutes."
-                    )
-
                     if st.button(
                         "Refresh connection status",
                         key=f"refresh_{toolkit}",
                     ):
                         st.rerun()
 
-    # --------------------------------------
+    # ======================================
     # GA4 PROPERTY SELECTION
-    # --------------------------------------
+    # ======================================
 
     if (
         ga4_connections
@@ -565,9 +652,7 @@ with tab_integrations:
         ]
 
         if not properties:
-            st.warning(
-                "No properties found for this connection."
-            )
+            st.warning("No GA4 properties found.")
 
         else:
             st.success(
@@ -600,8 +685,7 @@ with tab_integrations:
                     ] = list(selected)
 
                     st.success(
-                        f"Saved {len(selected)} "
-                        "properties for this session."
+                        f"Saved {len(selected)} properties."
                     )
                 else:
                     st.warning(
@@ -609,20 +693,26 @@ with tab_integrations:
                     )
 
             st.caption(
-                "This selection is temporary. "
-                "AI access enforcement will be added later."
+                "Selections are temporary. "
+                "AI data tool access is not enabled yet."
             )
 
 
 # ==========================================
-# AI CHAT - PLACEHOLDER
+# GEMINI AI CHAT PAGE
 # ==========================================
 
 with tab_chat:
     st.subheader("AI Chat")
 
+    st.caption(f"Powered by {GEMINI_MODEL}")
+
     if "messages" not in st.session_state:
         st.session_state.messages = []
+
+    if st.button("Clear conversation"):
+        st.session_state.messages = []
+        st.rerun()
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
@@ -631,24 +721,36 @@ with tab_chat:
     if prompt := st.chat_input(
         "Ask your AI Employee..."
     ):
-        st.session_state.messages.append({
-            "role": "user",
-            "content": prompt,
-        })
+
+        conversation = (
+            st.session_state.messages
+            + [{
+                "role": "user",
+                "content": prompt,
+            }]
+        )
 
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        response = (
-            "The chat interface is working. "
-            "Gemini and Composio tool execution "
-            "will be connected next."
-        )
-
         with st.chat_message("assistant"):
-            st.markdown(response)
+            with st.spinner("Thinking..."):
 
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": response,
-        })
+                try:
+                    answer = ask_gemini(conversation)
+
+                    st.markdown(answer)
+
+                    st.session_state.messages.extend([
+                        {
+                            "role": "user",
+                            "content": prompt,
+                        },
+                        {
+                            "role": "assistant",
+                            "content": answer,
+                        },
+                    ])
+
+                except RuntimeError as error:
+                    st.error(str(error))
