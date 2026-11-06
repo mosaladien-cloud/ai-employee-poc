@@ -1,33 +1,122 @@
 
+import json
+import urllib.request
+from urllib.error import HTTPError, URLError
+
 import streamlit as st
 
 st.set_page_config(page_title="AI Employee", page_icon="🤖")
 
+# Single-user proof of concept only.
+# Replace with verified login identity before inviting customers.
+TEST_USER_ID = "ai-employee-poc-owner"
+
+COMPOSIO_URL = (
+    "https://backend.composio.dev"
+    "/api/v3.1/connected_accounts/link"
+)
+
+APPS = {
+    "Google Analytics": "GA4_AUTH_CONFIG_ID",
+    "Google Ads": "GOOGLE_ADS_AUTH_CONFIG_ID",
+    "HubSpot": "HUBSPOT_AUTH_CONFIG_ID",
+}
+
+
+def create_connect_link(auth_config_id):
+    payload = json.dumps({
+        "user_id": TEST_USER_ID,
+        "auth_config_id": auth_config_id,
+        "callback_url": "https://ai-employee-poc.streamlit.app"
+    }).encode("utf-8")
+
+    request = urllib.request.Request(
+        COMPOSIO_URL,
+        data=payload,
+        headers={
+            "x-api-key": st.secrets["COMPOSIO_API_KEY"],
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.load(response)["redirect_url"]
+
+
 st.title("🤖 AI Employee")
-st.caption("Your personal AI-powered data assistant")
+st.caption("Your personal AI-powered assistant")
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+tab1, tab2 = st.tabs(["🔌 Integrations", "💬 AI Chat"])
 
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+with tab1:
+    st.subheader("Connect your data sources")
+    st.write("Choose an app to connect your account.")
 
-if prompt := st.chat_input("What would you like me to do?"):
-    st.session_state.messages.append({
-        "role": "user",
-        "content": prompt
-    })
+    if "connect_links" not in st.session_state:
+        st.session_state.connect_links = {}
 
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    for app_name, secret_name in APPS.items():
+        with st.container(border=True):
+            st.subheader(app_name)
 
-    response = "Hello! My chat interface is ready. AI integration is coming next."
+            if st.button(
+                f"Connect {app_name}",
+                key=f"connect_{secret_name}",
+            ):
+                try:
+                    with st.spinner("Preparing connection..."):
+                        url = create_connect_link(
+                            st.secrets[secret_name]
+                        )
+                        st.session_state.connect_links[app_name] = url
+                except HTTPError as error:
+                    st.error(
+                        f"Connection failed: HTTP {error.code}"
+                    )
+                except (URLError, TimeoutError, KeyError):
+                    st.error(
+                        "Unable to create the connection link."
+                    )
 
-    with st.chat_message("assistant"):
-        st.markdown(response)
+            if app_name in st.session_state.connect_links:
+                st.link_button(
+                    f"Authorize {app_name}",
+                    st.session_state.connect_links[app_name],
+                )
+                st.caption(
+                    "Complete authorization in the new tab. "
+                    "If the link expires, click Connect again."
+                )
 
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": response
-    })
+with tab2:
+    st.subheader("AI Chat")
+
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    if prompt := st.chat_input("Ask your AI Employee..."):
+        st.session_state.messages.append({
+            "role": "user",
+            "content": prompt,
+        })
+
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        response = (
+            "The chat interface is ready. "
+            "AI integration will be added next."
+        )
+
+        with st.chat_message("assistant"):
+            st.markdown(response)
+
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": response,
+        })
