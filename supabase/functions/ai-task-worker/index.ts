@@ -233,6 +233,20 @@ function resolveReportPeriod(instructions:string):ReportPeriod|undefined {
     return {startDate,endDate,label:"Requested dates "+startDate+" through "+endDate};
   }
 
+  const sinceDate=instructions.match(
+    /\b(?:from|between|since)\s+(\d{4}-\d{2}-\d{2})\s+(?:(?:to|through|until|and)\s+)?(today|yesterday|now)\b/i
+  )||instructions.match(
+    /(?:من)\s+(\d{4}-\d{2}-\d{2})\s+(?:إلى|الى|حتى|لغاية)\s+(اليوم|النهارده|امبارح|أمس|امس)/
+  );
+  if(sinceDate){
+    const startDate=sinceDate[1];
+    const endDate=/(?:yesterday|امبارح|أمس|امس)/i.test(sinceDate[2])
+      ?"yesterday":"today";
+    if(!isValidIsoDate(startDate)||dateSortKey(startDate)>dateSortKey(endDate))
+      throw new WorkerError("The requested start and end dates are invalid.");
+    return {startDate,endDate,label:"Requested dates "+startDate+" through "+endDate};
+  }
+
   const completedCalendarWeek=/\b(?:last|previous)\s+(?:calendar\s+)?week\b/i.test(instructions)
     || /(?:الأسبوع|الاسبوع)\s+(?:الماضي|السابق|اللي فات)/.test(instructions);
   if(completedCalendarWeek){
