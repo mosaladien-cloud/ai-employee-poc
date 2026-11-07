@@ -6,7 +6,7 @@ import time
 import html
 import re
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 import urllib.request
@@ -2982,10 +2982,28 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                 st.markdown(f"**{safe_html(task.get('title') or 'Untitled')}** · {safe_html(state.title())}")
                 st.caption(f"Next planned: {task_due_text(task)} · {(task.get('schedule_type') or 'once').title()}")
                 st.caption("Estimated processing: "+display_estimated_run_cost(task_id,estimates))
+                st.caption("Reporting period: " + report_period_label(task.get("instructions")))
                 if task.get("delivery_type") not in ("none",None):
-                    st.caption("Email / Slack delivery isn't active yet. Results are saved in your workspace.")
+                    st.caption("Delivery is attempted after a successful report. Check Run history for confirmation.")
                 with st.expander("Report instructions"):
-                    st.write(task.get("instructions") or "No instructions")
+                    visible_instructions, _ = split_report_period(task.get("instructions"))
+                    st.write(visible_instructions or "No instructions")
+                if state in ("draft", "active", "paused"):
+                    with st.expander("Edit reporting period"):
+                        _, current_selection = split_report_period(task.get("instructions"))
+                        revised_selection = render_report_period_picker(
+                            "saved_task_period_" + task_id, current_selection
+                        )
+                        st.caption("Changes apply to future runs; existing report results are unchanged.")
+                        if st.button("Save report dates", key="save_period_" + task_id,
+                                     use_container_width=True):
+                            try:
+                                update_saved_report_period(task, revised_selection)
+                                st.success("Reporting period updated.")
+                                st.rerun()
+                            except (ValueError, RuntimeError) as error:
+                                LOGGER.warning("Task period update failed: %s", str(error)[:180])
+                                st.warning("Unable to save dates. Check the period and try again.")
                 if state in ("draft","active"):
                     cols=st.columns(2)
                     with cols[0]:
@@ -3038,7 +3056,8 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                 if isinstance(details,dict) and details.get("summary"):
                     st.markdown(str(details["summary"]))
                 elif state=="failed":
-                    st.warning("This report couldn't be completed. Review the source connection and retry if needed.")
+                    reason=str(run.get("error_message") or "Check your source connection and monthly allowance.")
+                    st.warning("Report failed: " + reason[:250])
                 else:
                     st.caption("No report result is available yet.")
                 report_task=next((t for t in task_rows if t.get("id")==run.get("task_id")),None)
@@ -3100,7 +3119,7 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                 except (RuntimeError, ValueError, KeyError, TypeError) as error:
                     LOGGER.warning("Slack channel lookup failed: %s", str(error)[:220])
                     st.warning("Couldn't load channels. Review the connection in Integrations.")
-                st.caption("The selected channel can be saved with a task. Sending is not enabled yet.")
+                st.caption("The selected channel can be saved with a task. Delivery is confirmed in Run history.")
                 button_text = "Manage Slack connection"
             else:
                 st.info("Slack is not connected")
@@ -3109,7 +3128,7 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
             if st.button(button_text, key="tasks_slack_integration", use_container_width=True):
                 navigate_to("Integrations")
                 st.rerun()
-            st.caption("Automatic Slack sending is coming soon.")
+            st.caption("For successful reports, check Run history for Slack delivery status.")
         selected_gmail_target = None
         with st.container(border=True):
             gmail_account = active_connections.get("gmail")
@@ -3138,8 +3157,12 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
             if st.button(gmail_button, key="tasks_gmail_integration", use_container_width=True):
                 navigate_to("Integrations")
                 st.rerun()
-            st.caption("Recipient selections can be saved with new tasks. Actual email sending is not enabled yet.")
+            st.caption("Recipient selections are saved with new tasks. Check Run history to verify each delivery.")
         section("Create a report","Describe it in your own words or fill in the details")
+        with st.container(border=True):
+            st.markdown("**Select the report's data period**")
+            new_task_period = render_report_period_picker("new_report_period")
+            st.caption("This selects the dates GA4 will analyze. It does not change the task schedule.")
         with st.container(border=True):
             description=st.text_area("What would you like your AI Employee to do?",
                 placeholder="Every Monday, compare my GA4 traffic and conversions to the previous week.",
@@ -3166,8 +3189,8 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                     "Destination", ai_delivery_options,
                     format_func=lambda d: {
                         "none": "Save in workspace",
-                        "slack": "Selected Slack channel (sending coming soon)",
-                        "email": "Gmail recipients (sending coming soon)",
+                        "slack": "Selected Slack channel",
+                        "email": "Gmail recipients",
                     }[d], key="ai_task_delivery",
                 )
                 if st.button("Approve and save task",key="approve_ai_task",use_container_width=True):
@@ -3177,7 +3200,8 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                             tomorrow,datetime.now(CAIRO).replace(hour=9,minute=0,second=0,microsecond=0).time(),
                             ai_delivery,
                             (selected_slack_target if ai_delivery=="slack" else
-                             selected_gmail_target if ai_delivery=="email" else None))
+                             selected_gmail_target if ai_delivery=="email" else None),
+                            report_period=new_task_period)
                         st.session_state.pop("agent_task_draft",None)
                         st.success("Task saved to your workspace.")
                         st.rerun()
@@ -3203,8 +3227,8 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                 delivery=st.selectbox("Delivery",delivery_options,
                     format_func=lambda x:{
                         "none":"Save in workspace",
-                        "email":"Gmail recipients (sending coming soon)",
-                        "slack":"Selected Slack channel (sending coming soon)",
+                        "email":"Gmail recipients",
+                        "slack":"Selected Slack channel",
                     }[x])
                 destination = (
                     selected_gmail_target if delivery=="email" else
@@ -3213,11 +3237,12 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                 submit=st.form_submit_button("Save task plan",type="primary",use_container_width=True)
             if submit:
                 try:
-                    save_planned_task(title,instructions,schedule,planned_date,planned_time,delivery,destination)
+                    save_planned_task(title,instructions,schedule,planned_date,planned_time,
+                                      delivery,destination,report_period=new_task_period)
                     st.rerun()
                 except ValueError as error:st.warning(str(error))
                 except RuntimeError:st.error("Couldn't save your task right now.")
-            st.caption("Tasks are saved as drafts until activated. Email/Slack selections are preferences only; no messages are sent yet.")
+            st.caption("Tasks are saved as drafts until activated. Check Run history to confirm delivery after a report runs.")
 
 
 def render_usage(rows, usage_error=None, credit_status=None, credit_error=None):
