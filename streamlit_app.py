@@ -1,5 +1,5 @@
-# RELEASE_BUILD: AI_EMPLOYEE_V5_CLIENT_WORKSPACE_2026_11_07
-# Gemini usage ledger, business overview, client usage charts, inline integration management.
+# RELEASE_BUILD: AI_EMPLOYEE_V6_CREDITS_2026_11_07
+# Monthly credit limits, atomic reservation/settlement, business owner dashboard and task plans.
 import json
 import logging
 import time
@@ -38,6 +38,8 @@ SUPABASE_SECRET_KEY = st.secrets["SUPABASE_SECRET_KEY"]
 # The dashboard shows a PAID-TIER EQUIVALENT, not a billing statement.
 GEMINI_PRICES = {"input": Decimal("0.30"), "output": Decimal("2.50"), "cache": Decimal("0.03")}
 PRICE_VERSION = "gemini-3.5-flash-lite-standard-2026-11-07"
+# V6: SQL temporarily holds 100 credits per model call; charges actual priced tokens.
+MAX_GEMINI_PAYLOAD_BYTES = 120_000
 CAIRO = ZoneInfo("Africa/Cairo")
 LOGGER = logging.getLogger("ai_employee")
 
@@ -175,6 +177,7 @@ def clear_user_workspace():
         "verified_user_id", "active_google_analytics",
         "active_hubspot", "load_ga4", "auth_notice",
         "nav_page", "manage_toolkit", "pending_connection_since",
+        "credit_last_status",
     )
     for key in keys:
         st.session_state.pop(key, None)
@@ -405,7 +408,8 @@ def usage_db_request(method="GET", body=None, query=None):
         if not SUPABASE_SECRET_KEY.startswith("sb_secret_"):
             raise RuntimeError("Backend usage key is not configured correctly.")
         headers["apikey"] = SUPABASE_SECRET_KEY
-        headers["Prefer"] = "return=minimal"
+        # Model-call IDs make usage writes idempotent across network retries.
+        headers["Prefer"] = "return=minimal,resolution=ignore-duplicates"
     return http_json(url, method=method, body=body, headers=headers, timeout=25)
 
 
@@ -417,6 +421,129 @@ def usage_identity():
         return str(uuid.UUID(user_id))
     except (TypeError, ValueError):
         raise RuntimeError("Account identity could not be verified.") from None
+
+
+class CreditLimitReached(RuntimeError):
+    """Insufficient available monthly allowance for another model call."""
+
+
+class CreditServiceUnavailable(RuntimeError):
+    """The authoritative balance cannot be checked; fail closed."""
+
+
+def credit_rpc(name, payload=None, backend=False):
+    """Call only narrowly granted Postgres RPC endpoints.
+
+    Customer balance: user's JWT + RLS-safe get_my_credit_status().
+    Reserve/settle/release: the server secret; never embed it in the page.
+    """
+    approved = {
+        "get_my_credit_status": False,
+        "reserve_ai_credit_call": True,
+        "settle_ai_credit_call": True,
+        "release_ai_credit_call": True,
+    }
+    if approved.get(name) is not backend:
+        raise RuntimeError("Credit operation is not permitted.")
+    headers = {"apikey": SUPABASE_SECRET_KEY if backend else SUPABASE_PUBLISHABLE_KEY,
+               "Content-Type": "application/json", "Accept": "application/json"}
+    if not backend:
+        token = (st.session_state.get("auth_tokens") or {}).get("access_token")
+        if not token or not st.session_state.get("verified_user_id"):
+            raise CreditServiceUnavailable("Sign in to view your allowance.")
+        headers["Authorization"] = "Bearer " + token
+    elif not SUPABASE_SECRET_KEY.startswith("sb_secret_"):
+        raise CreditServiceUnavailable("Credit backend key is not configured.")
+    result = http_json(
+        SUPABASE_URL + "/rest/v1/rpc/" + name,
+        method="POST", body=payload or {}, headers=headers, timeout=30,
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError("Unexpected credit-service response.")
+    return result
+
+
+def fetch_credit_status():
+    usage_identity()  # verified identity required
+    result = credit_rpc("get_my_credit_status")
+    needed = ("monthly_limit", "used_credits", "pending_credits", "remaining_credits", "reset_at")
+    if not all(key in result for key in needed):
+        raise RuntimeError("Incomplete credit balance.")
+    # Never let client-facing numbers come from cached or guessed values.
+    return result
+
+
+def reserve_model_credits(request_id, call_id):
+    user_id = usage_identity()  # only the authenticated owner's Supabase UUID
+    try:
+        return credit_rpc("reserve_ai_credit_call", {
+            "p_user_id": user_id, "p_request_id": request_id, "p_call_id": call_id,
+        }, backend=True)
+    except RuntimeError as error:
+        if "INSUFFICIENT_CREDITS" in str(error):
+            raise CreditLimitReached("Insufficient monthly credits for a new request.") from None
+        LOGGER.error("Credit reservation failed for verified user: %s", str(error)[:350])
+        raise CreditServiceUnavailable("Monthly usage is temporarily unavailable.") from None
+
+
+def settle_model_credits(call_id):
+    try:
+        return credit_rpc("settle_ai_credit_call", {
+            "p_user_id": usage_identity(), "p_call_id": call_id,
+        }, backend=True)
+    except RuntimeError as error:
+        LOGGER.error("Credit settlement failed: %s", str(error)[:350])
+        raise CreditServiceUnavailable("Could not finalize your usage.") from None
+
+
+def release_model_credits(call_id):
+    # Best effort only for FAILED provider requests before any usage was stored.
+    try:
+        credit_rpc("release_ai_credit_call", {
+            "p_user_id": usage_identity(), "p_call_id": call_id,
+        }, backend=True)
+    except RuntimeError as error:
+        LOGGER.warning("Credit hold release pending: %s", str(error)[:250])
+
+
+def pretty_credits(value):
+    value = amount(value)
+    return f"{value:,.2f}"
+
+
+def render_monthly_allowance(status, error=None):
+    """Business-friendly view: actual balance, no model/vendor details."""
+    if error or not status:
+        st.warning("Your monthly allowance is temporarily unavailable. New AI requests are paused until it can be checked.")
+        return
+    total = max(Decimal(0), amount(status.get("monthly_limit")))
+    used = max(Decimal(0), amount(status.get("used_credits")))
+    held = max(Decimal(0), amount(status.get("pending_credits")))
+    remain = max(Decimal(0), amount(status.get("remaining_credits")))
+    percent = float(min(Decimal(100), (used/total)*100)) if total else 100.0
+    # Darker section is the spent portion; muted remainder is the allowance left.
+    css = f"conic-gradient(#4f46e5 0% {percent:.2f}%, #e5e9f2 {percent:.2f}% 100%)"
+    reset = "Next month"
+    try:
+        reset_dt = datetime.fromisoformat(str(status["reset_at"]).replace("Z", "+00:00"))
+        reset = reset_dt.astimezone(CAIRO).strftime("%b %d, %Y")
+    except (TypeError, ValueError, KeyError):
+        pass
+    st.markdown(
+        '<div class="credit-layout">'
+        f'<div class="credit-donut" style="background:{css}">'
+        '<div class="credit-donut-center">'
+        f'<strong>{pretty_credits(remain)}</strong><span>remaining</span></div></div>'
+        '<div class="credit-summary">'
+        f'<div><small>Monthly limit</small><strong>{pretty_credits(total)} credits</strong></div>'
+        f'<div><small>Used this month</small><strong>{pretty_credits(used)} credits</strong></div>'
+        f'<div><small>Available now</small><strong>{pretty_credits(remain)} credits</strong></div>'
+        f'<div><small>Next reset</small><strong>{safe_html(reset)}</strong></div>'
+        '</div></div>', unsafe_allow_html=True,
+    )
+    if held:
+        st.caption(f"{pretty_credits(held)} credits are temporarily reserved for a request in progress.")
+    st.caption("Your allowance renews on the first day of each month (Cairo time).")
 
 
 def normalize_gemini_usage(raw):
@@ -459,16 +586,21 @@ def estimated_paid_cost(counts):
     return str(value.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP))
 
 
-def record_model_usage(gemini_response, request_id):
+def record_model_usage(gemini_response, request_id, model_call_id):
     """Persist one row per Gemini API response, even intermediate tool turns."""
     account_id = usage_identity()
     raw = gemini_response.get("usageMetadata")
     counts = normalize_gemini_usage(raw)
+    if counts is None or counts["total_tokens"] <= 0:
+        # A successful provider response without usage cannot be priced accurately.
+        # The held credits remain temporarily blocked and expire automatically.
+        raise RuntimeError("Missing provider usage metadata; request cannot be metered.")
     parts = ((gemini_response.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
     requested_tools = sum(bool(isinstance(part, dict) and "functionCall" in part) for part in parts)
     row = {
         "user_id": account_id,
         "request_id": request_id,
+        "model_call_id": model_call_id,
         "usage_type": "chat",
         "provider": "gemini",
         "model": GEMINI_MODEL,
@@ -487,7 +619,7 @@ def record_model_usage(gemini_response, request_id):
     }
     # Fail closed: no additional AI turns can execute if usage cannot be logged.
     try:
-        usage_db_request("POST", body=row)
+        usage_db_request("POST", body=row, query={"on_conflict": "model_call_id"})
     except RuntimeError:
         raise RuntimeError("Usage recording is unavailable. Your request was stopped to prevent untracked usage.") from None
 
@@ -1189,82 +1321,71 @@ def gemini_generate(contents, system_prompt,
         "https://generativelanguage.googleapis.com/"
         f"v1beta/models/{GEMINI_MODEL}:generateContent"
     )
-
     payload = {
         "contents": contents,
-        "systemInstruction": {
-            "parts": [{"text": system_prompt}]
-        },
-        "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 4096,
-        },
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4096},
     }
-
     if tool_definitions:
         payload["tools"] = [{
             "functionDeclarations": [{
                 "name": "execute_read_tool",
                 "description": (
-                    "Execute one approved read-only "
-                    "Composio tool using arguments "
-                    "matching its documented schema."
+                    "Execute one approved read-only Composio tool using "
+                    "arguments matching its documented schema."
                 ),
                 "parametersJsonSchema": {
                     "type": "object",
                     "properties": {
-                        "tool_slug": {
-                            "type": "string",
-                            "enum": list(
-                                tool_definitions.keys()
-                            ),
-                        },
+                        "tool_slug": {"type": "string", "enum": list(tool_definitions.keys())},
                         "arguments_json": {
                             "type": "string",
-                            "description": (
-                                "A valid JSON object encoded "
-                                "as a string, containing the "
-                                "chosen tool's input arguments."
-                            ),
+                            "description": "JSON object encoded as string matching the chosen tool inputs.",
                         },
                     },
-                    "required": [
-                        "tool_slug",
-                        "arguments_json",
-                    ],
+                    "required": ["tool_slug", "arguments_json"],
                 },
             }]
         }]
 
-    # The provider can temporarily respond with HTTP 503 during high demand.
-    # Retry only transient capacity errors, at most twice, with backoff.
-    # Never repeat a request after receiving a successful response.
-    for attempt in range(3):
-        try:
-            response = http_json(
-                url,
-                method="POST",
-                body=payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "x-goog-api-key": st.secrets["GOOGLE_API_KEY"],
-                },
-                timeout=90,
-            )
-            break
-        except RuntimeError as error:
-            message = str(error)
-            if message.startswith("HTTP 503"):
-                if attempt < 2:
-                    time.sleep(1.5 * (2 ** attempt))
-                    continue
-                raise AIServiceBusy("The AI service is busy right now.") from None
-            if message.startswith("HTTP 429"):
-                raise AIServiceRateLimited("The AI service is receiving too many requests.") from None
-            raise
-    # Every successful model response is recorded, including intermediate
-    # tool-calling turns. Never retry a response because the ledger failed.
-    record_model_usage(response, request_id)
+    # Bound potential input cost before credit reservation. Output is capped
+    # to 4096 tokens; the SQL hold is 100 credits per model invocation.
+    payload_bytes = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    if payload_bytes > MAX_GEMINI_PAYLOAD_BYTES:
+        raise RuntimeError("This analysis is too large. Try a shorter request or fewer results.")
+
+    call_id = str(uuid.uuid4())
+    reserve_model_credits(request_id, call_id)  # Atomic backend preflight.
+    try:
+        # Retry only transient capacity errors. Do NOT charge on failed calls.
+        for attempt in range(3):
+            try:
+                response = http_json(
+                    url, method="POST", body=payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "x-goog-api-key": st.secrets["GOOGLE_API_KEY"],
+                    }, timeout=90,
+                )
+                break
+            except RuntimeError as error:
+                message = str(error)
+                if message.startswith("HTTP 503"):
+                    if attempt < 2:
+                        time.sleep(1.5 * (2 ** attempt))
+                        continue
+                    raise AIServiceBusy("The AI service is busy right now.") from None
+                if message.startswith("HTTP 429"):
+                    raise AIServiceRateLimited("The AI service is receiving too many requests.") from None
+                raise
+    except RuntimeError:
+        release_model_credits(call_id)
+        raise
+
+    # Do NOT retry a successful provider response. Persist the actual usage
+    # first; the SQL settle RPC verifies and charges the recorded amount.
+    record_model_usage(response, request_id, call_id)
+    settle_model_credits(call_id)
     return response
 
 
@@ -1647,6 +1768,17 @@ p {color:#53637a;}
 .task-badge{font-size:10px;padding:5px 8px;border-radius:20px;background:#f3f0ff;color:#554fbc;font-weight:700;}
 .business-empty{background:#f8faff;border:1px dashed #d8e0ee;border-radius:12px;padding:20px;color:#7989a2;font-size:13px;line-height:1.7;}
 @media(max-width:850px){.business-usage{gap:12px;}.business-usage-donut{width:145px;height:145px;}.business-usage-inner{width:111px;height:111px;}}
+/* V6: real monthly allowance and credit spending */
+.credit-layout{display:flex;align-items:center;gap:30px;flex-wrap:wrap;padding:14px 8px 10px;}
+.credit-donut{width:178px;height:178px;border-radius:50%;display:grid;place-items:center;flex-shrink:0;}
+.credit-donut-center{width:135px;height:135px;border-radius:50%;background:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;}
+.credit-donut-center strong{font-size:27px;font-weight:800;color:#1f2e48;letter-spacing:-.05em;line-height:1.25;}
+.credit-donut-center span{font-size:12px;color:#8794a9;}
+.credit-summary{display:grid;grid-template-columns:repeat(2,minmax(120px,1fr));flex:1;gap:16px;}
+.credit-summary div{display:flex;flex-direction:column;gap:7px;}
+.credit-summary small{font-size:11px;color:#8694a8;}
+.credit-summary strong{font-size:15px;color:#25354f;}
+@media(max-width:650px){.credit-summary{grid-template-columns:1fr;}.credit-layout{gap:15px;}.credit-donut{width:146px;height:146px;}.credit-donut-center{width:110px;height:110px;}}
 </style>
 """
 
@@ -1881,7 +2013,8 @@ def render_sidebar(user, current_connections):
 
 
 def render_overview(user, active_connections, connection_errors, rows,
-                    usage_error=None, tasks=None, task_runs=None, tasks_error=None):
+                    usage_error=None, tasks=None, task_runs=None, tasks_error=None,
+                    credit_status=None, credit_error=None):
     """Business-owner view: progress, task plans, next dates, and product usage."""
     tasks, task_runs = tasks or [], task_runs or []
     now, month_start, last_30 = cairo_periods()
@@ -1908,7 +2041,10 @@ def render_overview(user, active_connections, connection_errors, rows,
     with k3: metric_card("Completed runs", "—" if tasks_error else str(completed_runs), "This month")
     with k4: metric_card("AI activities", "—" if usage_error else str(monthly["requests"]), "This month")
 
-    section("Your monthly usage", "Conversations and scheduled work in your workspace")
+    section("Monthly allowance", "Your AI Employee usage and remaining credits")
+    with st.container(border=True):
+        render_monthly_allowance(credit_status, credit_error)
+    section("Your monthly activity", "Conversations and scheduled work in your workspace")
     left, right = st.columns([1, 1.18], gap="large")
     with left:
         with st.container(border=True):
@@ -1969,12 +2105,12 @@ def render_overview(user, active_connections, connection_errors, rows,
             else:
                 st.caption("Your activity history will appear here after your first AI request.")
             st.divider()
-            st.markdown("**Processing estimate**")
-            if usage_error:
-                st.caption("Not available right now")
+            st.markdown("**Monthly credits**")
+            if credit_error or not credit_status:
+                st.caption("Allowance is temporarily unavailable")
             else:
-                st.markdown(f"**{format_cost(monthly['cost'])}**")
-                st.caption("Estimated AI processing cost this month, not a charge or invoice. Other services are not included.")
+                st.markdown(f"**{pretty_credits(credit_status.get('remaining_credits'))} remaining**")
+                st.caption("Available to use this month")
     if connection_errors:
         st.caption("Some connected services couldn't be checked at the moment.")
 
@@ -2254,6 +2390,10 @@ def render_ai_chat(active_connections):
                             st.warning("Your AI Employee is receiving heavy demand right now. Please try your question again shortly.")
                         except AIServiceRateLimited:
                             st.warning("You've reached the current request limit. Please try again later.")
+                        except CreditLimitReached:
+                            st.warning("Your monthly credits are running low. You need more available credits to start another request; your allowance resets next month.")
+                        except CreditServiceUnavailable:
+                            st.warning("Your allowance couldn't be checked. New requests are paused temporarily to protect your account.")
                         except RuntimeError as error:
                             LOGGER.warning("AI request failed: %s", str(error)[:400])
                             if "Usage recording is unavailable" in str(error):
@@ -2349,7 +2489,7 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
             st.caption("These dates are planning details. No task will run or send a report until the execution service is enabled.")
 
 
-def render_usage(rows, usage_error=None):
+def render_usage(rows, usage_error=None, credit_status=None, credit_error=None):
     page_header("Usage", "See how your AI Employee is being used.", tag="YOUR ACTIVITY")
     now, month_start, last_30 = cairo_periods()
     summary = usage_summary(rows, month_start)
@@ -2361,6 +2501,9 @@ def render_usage(rows, usage_error=None):
     with k1: metric_card("Total activities", "—" if usage_error else summary["requests"], "This month")
     with k2: metric_card("Conversations", "—" if usage_error else chat_count, "Questions and analyses")
     with k3: metric_card("Automated runs", "—" if usage_error else automation_count, "Tracked reports and workflows")
+    section("Monthly allowance", "Credits available to your AI Employee")
+    with st.container(border=True):
+        render_monthly_allowance(credit_status, credit_error)
     section("Activity overview", "A clear picture of your usage")
     left, right = st.columns([1, 1.2], gap="large")
     with left:
@@ -2377,13 +2520,7 @@ def render_usage(rows, usage_error=None):
                 st.caption("Chart unavailable")
             else:
                 render_daily_activity_chart(thirty)
-    with st.expander("Processing cost estimate"):
-        if usage_error:
-            st.caption("Estimate temporarily unavailable")
-        else:
-            st.markdown(f"**{format_cost(summary['cost'])}** — estimated AI processing this month")
-            st.caption("This is an indicative paid-tier processing estimate, not an invoice. It does not include integration, hosting, or other platform costs.")
-        st.caption("Usage credits and monthly limits will become available after the credits system is activated.")
+    st.caption("Credits reflect the estimated processing of your AI requests. Scheduled automation credits will count here when automation is enabled.")
 
 
 def render_settings(user):
@@ -2426,6 +2563,14 @@ if "connect_links" not in st.session_state:
 active_connections, accounts_by_toolkit, connection_errors = load_connection_state()
 page = render_sidebar(user, active_connections)
 
+credit_status, credit_error = None, None
+if page in ("Overview", "Usage"):
+    try:
+        credit_status = fetch_credit_status()
+    except RuntimeError as error:
+        credit_error = str(error)
+        LOGGER.warning("Credit balance read failed: %s", str(error)[:300])
+
 usage_rows = []
 usage_error = None
 if page in ("Overview", "Usage", "My Tasks"):
@@ -2446,7 +2591,8 @@ if page in ("Overview", "My Tasks"):
 
 if page == "Overview":
     render_overview(user, active_connections, connection_errors, usage_rows,
-                    usage_error, task_rows, task_runs, tasks_error)
+                    usage_error, task_rows, task_runs, tasks_error,
+                    credit_status, credit_error)
 elif page == "AI Chat":
     render_ai_chat(active_connections)
 elif page == "My Tasks":
@@ -2454,6 +2600,6 @@ elif page == "My Tasks":
 elif page == "Integrations":
     render_integrations(accounts_by_toolkit, active_connections, connection_errors)
 elif page == "Usage":
-    render_usage(usage_rows, usage_error)
+    render_usage(usage_rows, usage_error, credit_status, credit_error)
 elif page == "Settings":
     render_settings(user)
