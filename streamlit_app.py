@@ -1,8 +1,12 @@
-# RELEASE_BUILD: AI_EMPLOYEE_UI_V3_2026_11_07_VERIFIED
-# Includes Quick Actions, enhanced Overview, fixed logos, and OAuth popup.
+# RELEASE_BUILD: AI_EMPLOYEE_UI_V4_USAGE_2026_11_07_VERIFIED
+# Gemini usage ledger, business overview, client usage charts, inline integration management.
 import json
 import time
 import html
+import uuid
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
+from zoneinfo import ZoneInfo
 import urllib.request
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, quote
@@ -27,6 +31,13 @@ GEMINI_MODEL = "gemini-3.5-flash-lite"
 
 SUPABASE_URL = st.secrets["SUPABASE_URL"].rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = st.secrets["SUPABASE_PUBLISHABLE_KEY"]
+SUPABASE_SECRET_KEY = st.secrets["SUPABASE_SECRET_KEY"]
+
+# Standard paid-tier token prices (USD per million tokens; reviewed 2026-11-07).
+# The dashboard shows a PAID-TIER EQUIVALENT, not a billing statement.
+GEMINI_PRICES = {"input": Decimal("0.30"), "output": Decimal("2.50"), "cache": Decimal("0.03")}
+PRICE_VERSION = "gemini-3.5-flash-lite-standard-2026-11-07"
+CAIRO = ZoneInfo("Africa/Cairo")
 
 # Separate, verified Composio identity for each Supabase user.
 # Do not reuse the old shared test identity.
@@ -161,7 +172,7 @@ def clear_user_workspace():
         "active_ga4_property", "messages", "authenticated_user",
         "verified_user_id", "active_google_analytics",
         "active_hubspot", "load_ga4", "auth_notice",
-        "nav_page", "manage_toolkit", "pending_connection_since",
+        "nav_page", "manage_toolkit", "pending_connection_since", "pending_connection_since",
     )
     for key in keys:
         st.session_state.pop(key, None)
@@ -359,6 +370,227 @@ def render_login():
             "Early access · Email confirmation may be required. "
             "Sign in manually after confirming your email."
         )
+
+
+# ==========================================
+# SUPABASE USAGE LEDGER (SERVER SIDE ONLY)
+# ==========================================
+
+
+def usage_db_request(method="GET", body=None, query=None):
+    """Server-side only. Never expose or proxy the secret key to the browser.
+
+    Callers use the Supabase Auth verified identity, not a user-supplied ID.
+    Secret keys bypass RLS, so all SELECTs are explicitly user-filtered.
+    """
+    url = SUPABASE_URL + "/rest/v1/ai_usage"
+    if query:
+        url += "?" + urlencode(query)
+    headers = {
+        "apikey": SUPABASE_SECRET_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if method != "GET":
+        headers["Prefer"] = "return=minimal"
+    return http_json(url, method=method, body=body, headers=headers, timeout=25)
+
+
+def usage_identity():
+    user_id = st.session_state.get("verified_user_id")
+    if not user_id:
+        raise RuntimeError("Sign in to use your AI Employee.")
+    try:
+        return str(uuid.UUID(user_id))
+    except (TypeError, ValueError):
+        raise RuntimeError("Account identity could not be verified.") from None
+
+
+def normalize_gemini_usage(raw):
+    """Respect the API's individual input / candidate / thought token counts."""
+    if not isinstance(raw, dict) or not any(
+        key in raw for key in ("promptTokenCount", "candidatesTokenCount", "thoughtsTokenCount", "toolUsePromptTokenCount")
+    ):
+        return None
+    def count(key):
+        try:
+            return max(0, int(raw.get(key, 0) or 0))
+        except (ValueError, TypeError):
+            return 0
+    # Tool-use prompt tokens may be reported separately from the normal prompt.
+    # They are part of the request's total input-token usage.
+    prompt = count("promptTokenCount") + count("toolUsePromptTokenCount")
+    response = count("candidatesTokenCount")
+    thinking = count("thoughtsTokenCount")
+    cached = min(prompt, count("cachedContentTokenCount"))
+    total = count("totalTokenCount") or prompt + response + thinking
+    return {
+        "input_tokens": prompt,
+        "output_tokens": response,
+        "thinking_tokens": thinking,
+        "cached_input_tokens": cached,
+        "total_tokens": total,
+    }
+
+
+def estimated_paid_cost(counts):
+    # The output tariff includes thinking tokens. Cached prompt tokens
+    # have their own rate when reported by the API.
+    tokens = Decimal(1_000_000)
+    uncached = max(0, counts["input_tokens"] - counts["cached_input_tokens"])
+    value = (
+        Decimal(uncached) * GEMINI_PRICES["input"]
+        + Decimal(counts["cached_input_tokens"]) * GEMINI_PRICES["cache"]
+        + Decimal(counts["output_tokens"] + counts["thinking_tokens"]) * GEMINI_PRICES["output"]
+    ) / tokens
+    return str(value.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP))
+
+
+def record_model_usage(gemini_response, request_id):
+    """Persist one row per Gemini API response, even intermediate tool turns."""
+    account_id = usage_identity()
+    raw = gemini_response.get("usageMetadata")
+    counts = normalize_gemini_usage(raw)
+    parts = ((gemini_response.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+    requested_tools = sum(bool(isinstance(part, dict) and "functionCall" in part) for part in parts)
+    row = {
+        "user_id": account_id,
+        "request_id": request_id,
+        "usage_type": "chat",
+        "provider": "gemini",
+        "model": GEMINI_MODEL,
+        "tool_calls": requested_tools,  # Model-requested tools, NOT billed Composio calls.
+        "usage_metadata": raw if isinstance(raw, dict) else {},
+        "pricing_version": PRICE_VERSION,
+        "cost_status": "estimated_paid_tier" if counts is not None else "metadata_missing",
+        "estimated_cost_usd": estimated_paid_cost(counts) if counts else "0",
+        **(counts or {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "thinking_tokens": 0,
+            "cached_input_tokens": 0,
+            "total_tokens": 0,
+        }),
+    }
+    # Fail closed: no additional AI turns can execute if usage cannot be logged.
+    try:
+        usage_db_request("POST", body=row)
+    except RuntimeError:
+        raise RuntimeError("Usage recording is unavailable. Your request was stopped to prevent untracked usage.") from None
+
+
+def fetch_usage_rows(lookback_days=93):
+    """Paginate explicit owner-filtered rows; never silently truncate totals."""
+    user_id = usage_identity()
+    since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
+    records = []
+    for offset in range(0, 10000, 500):
+        query = {
+            "select": "id,request_id,model,input_tokens,output_tokens,thinking_tokens,cached_input_tokens,total_tokens,tool_calls,estimated_cost_usd,cost_status,created_at",
+            "user_id": "eq." + user_id,
+            "created_at": "gte." + since,
+            "order": "created_at.desc",
+            "limit": "500",
+            "offset": str(offset),
+        }
+        result = usage_db_request("GET", query=query)
+        if not isinstance(result, list):
+            raise RuntimeError("Unable to retrieve usage history.")
+        records.extend(result)
+        if len(result) < 500:
+            return records
+    raise RuntimeError("Usage history exceeds the current dashboard limit; totals were not displayed.")
+
+
+def amount(value):
+    try:
+        return Decimal(str(value or 0))
+    except Exception:
+        return Decimal(0)
+
+
+def usage_summary(rows, since):
+    filtered = []
+    for row in rows:
+        try:
+            day = datetime.fromisoformat(row["created_at"].replace("Z", "+00:00")).astimezone(CAIRO)
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+        if day >= since:
+            filtered.append((row, day))
+    def val(row, name):
+        try:
+            return max(0, int(row.get(name) or 0))
+        except (TypeError, ValueError):
+            return 0
+    requests = set()
+    for row, _ in filtered:
+        requests.add(row.get("request_id") or row.get("id"))
+    return {
+        "requests": len(requests),
+        "api_calls": len(filtered),
+        "input": sum(val(row,"input_tokens") for row,_ in filtered),
+        "output": sum(val(row,"output_tokens") for row,_ in filtered),
+        "thinking": sum(val(row,"thinking_tokens") for row,_ in filtered),
+        "tokens": sum(val(row,"total_tokens") for row,_ in filtered),
+        "tools": sum(val(row,"tool_calls") for row,_ in filtered),
+        "cost": sum((amount(row.get("estimated_cost_usd")) for row,_ in filtered), Decimal(0)),
+        "unpriced": sum(row.get("cost_status") == "metadata_missing" for row,_ in filtered),
+        "rows": filtered,
+    }
+
+
+def cairo_periods():
+    now = datetime.now(CAIRO)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    last_30 = (now - timedelta(days=29)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return now, month_start, last_30
+
+
+def format_tokens(value):
+    return f"{int(value):,}"
+
+
+def format_cost(value):
+    return f"${amount(value):,.4f}"
+
+
+def usage_donut(summary):
+    # Donut shows token composition, NOT credits or remaining balance.
+    a,b,c = summary["input"], summary["output"], summary["thinking"]
+    total = a+b+c
+    if not total:
+        background = "conic-gradient(#e8ebf3 0% 100%)"
+    else:
+        p = a/total*100
+        q = b/total*100
+        background = (f"conic-gradient(#5852d6 0% {p:.5f}%, "
+                      f"#38bdf8 {p:.5f}% {p+q:.5f}%, "
+                      f"#f59e0b {p+q:.5f}% 100%)")
+    st.markdown(
+        '<div class="usage-visual-row">'
+        f'<div class="usage-donut" style="background:{background}">'
+        f'<div class="usage-donut-hole"><strong>{safe_html(format_tokens(total))}</strong><small>tokens</small></div></div>'
+        '<div class="usage-legend">'
+        f'<div><span class="legend-dot" style="background:#5852d6"></span>Input <strong>{format_tokens(a)}</strong></div>'
+        f'<div><span class="legend-dot" style="background:#38bdf8"></span>Output <strong>{format_tokens(b)}</strong></div>'
+        f'<div><span class="legend-dot" style="background:#f59e0b"></span>Thinking <strong>{format_tokens(c)}</strong></div>'
+        '</div></div>', unsafe_allow_html=True,
+    )
+    st.caption("Breakdown of measured Gemini tokens — not a plan-credit balance.")
+
+
+def usage_daily_chart(summary, days=30):
+    now, _, _ = cairo_periods()
+    base = now.date() - timedelta(days=days-1)
+    daily = {base + timedelta(days=i): 0 for i in range(days)}
+    for row, when in summary["rows"]:
+        d = when.date()
+        if d in daily:
+            daily[d] += int(row.get("total_tokens") or 0)
+    # Streamlit's native chart uses its bundled plotting stack; no extra pip package.
+    st.bar_chart({"Day": [d.strftime("%b %d") for d in daily],
+                  "Tokens": list(daily.values())}, x="Day", y="Tokens", height=225)
 
 
 # ==========================================
@@ -741,7 +973,7 @@ def load_ga4_properties(connection_id):
 # ==========================================
 
 def gemini_generate(contents, system_prompt,
-                    tool_definitions):
+                    tool_definitions, request_id):
     url = (
         "https://generativelanguage.googleapis.com/"
         f"v1beta/models/{GEMINI_MODEL}:generateContent"
@@ -793,7 +1025,7 @@ def gemini_generate(contents, system_prompt,
             }]
         }]
 
-    return http_json(
+    response = http_json(
         url,
         method="POST",
         body=payload,
@@ -803,9 +1035,12 @@ def gemini_generate(contents, system_prompt,
         },
         timeout=90,
     )
+    record_model_usage(response, request_id)
+    return response
 
 
 def ask_ai(messages, connections, active_property):
+    request_id = str(uuid.uuid4())  # Shared by all Gemini calls for one chat request.
     definitions = get_available_tool_definitions(
         connections,
         active_property,
@@ -880,6 +1115,7 @@ when comparisons need multiple queries.
             contents,
             system_prompt,
             definitions,
+            request_id,
         )
 
         candidates = result.get("candidates", [])
@@ -1152,6 +1388,16 @@ p {color:#53637a;}
 .oauth-launch-link{display:block;text-align:center;padding:12px 14px;border-radius:9px;background:#4f46e5;color:white!important;text-decoration:none!important;font-weight:750;font-family:'DM Sans',sans-serif;font-size:13px;min-height:42px;}
 .oauth-launch-link:hover{background:#4338ca;color:#fff!important;}
 
+/* Customer-facing usage visuals */
+.usage-visual-row{display:flex;align-items:center;gap:30px;flex-wrap:wrap;padding:15px 0;}
+.usage-donut{height:166px;width:166px;display:flex;align-items:center;justify-content:center;border-radius:50%;flex-shrink:0;}
+.usage-donut-hole{background:#fff;height:120px;width:120px;border-radius:50%;display:flex;flex-direction:column;justify-content:center;align-items:center;}
+.usage-donut-hole strong{color:#283754;font-size:22px;font-weight:800;line-height:1.3;}
+.usage-donut-hole small{color:#8b97aa;font-size:11px;}
+.usage-legend{display:grid;gap:14px;min-width:195px;}
+.usage-legend div{display:flex;align-items:center;gap:9px;color:#7a879e;font-size:12px;}
+.usage-legend strong{margin-left:auto;color:#22334e;font-size:12px;}
+.legend-dot{display:inline-block;width:10px;height:10px;border-radius:3px;flex-shrink:0;}
 @media (max-width:900px){.block-container{padding-left:1rem;padding-right:1rem;padding-top:1.3rem;}.page-title{font-size:26px;}.hero-card{padding:22px;}}
 </style>
 """
@@ -1386,116 +1632,62 @@ def render_sidebar(user, current_connections):
     return page
 
 
-def render_overview(user, active_connections, connection_errors):
-    """Action-first overview: only authentic and account-scoped information."""
-    first = (user.get("email") or "there").split("@")[0].replace(".", " ").title()
-    page_header(
-        "Overview",
-        "Everything you need to work with your AI Employee, in one place.",
-        tag="YOUR WORKSPACE",
-    )
-    ready_count = len(active_connections)
-    approved = st.session_state.get("approved_ga4_properties", [])
-    has_chat = bool(st.session_state.get("messages"))
-    user_ready = bool(ready_count and ("hubspot" in active_connections or approved))
-    status_text = "Ready to analyze" if user_ready else "Ready to connect"
+def render_overview(user, active_connections, connection_errors, rows):
+    """Executive overview: real usage metrics without duplicate navigation."""
+    now, month_start, last_30 = cairo_periods()
+    usage = usage_summary(rows, month_start)
+    usage_30 = usage_summary(rows, last_30)
+    first = (user.get("email") or "there").split("@")[0].replace("."," ").title()
+    page_header("Overview", "A clear view of your AI Employee's activity.", tag="WORKSPACE")
     st.markdown(
-        '<div class="hero-card">'
-        '<div class="hero-kicker">✦ YOUR AI EMPLOYEE · ' + safe_html(status_text.upper()) + '</div>'
+        '<div class="hero-card"><div class="hero-kicker">YOUR AI EMPLOYEE · WORKSPACE</div>'
         f'<h2>Welcome back, {safe_html(first)}.</h2>'
-        '<p>What would you like to accomplish today? Get answers from your data, '
-        'connect a source, or manage upcoming work — all from this workspace.</p>'
-        '</div>', unsafe_allow_html=True,
+        '<p>Stay on top of your connected sources and AI activity. '
+        'Your latest monthly figures are updated from your workspace.</p></div>',
+        unsafe_allow_html=True,
     )
-    st.markdown('<div class="quick-actions-title">QUICK ACTIONS</div>', unsafe_allow_html=True)
-    qa1, qa2, qa3, qa4 = st.columns([1, 1, 1, 1], gap="medium")
-    with qa1:
-        st.button("✦  Ask AI", type="primary", use_container_width=True,
-                  key="overview_ask", on_click=navigate_to, args=("AI Chat",))
-    with qa2:
-        st.button("⛓  Connect Data", use_container_width=True,
-                  key="overview_connect", on_click=navigate_to, args=("Integrations",))
-    with qa3:
-        st.button("☑  My Tasks", use_container_width=True,
-                  key="overview_tasks", on_click=navigate_to, args=("My Tasks",))
-    with qa4:
-        st.button("◫  View Usage", use_container_width=True,
-                  key="overview_usage", on_click=navigate_to, args=("Usage",))
-
-    st.markdown('<div style="height:12px"></div>', unsafe_allow_html=True)
-    a, b, c, d = st.columns(4, gap="medium")
-    with a:
-        metric_card("Connected sources", ready_count, "Active in your workspace")
-    with b:
-        metric_card("Available integrations", len(APPS), "Sources you can connect")
-    with c:
-        metric_card("Scheduled tasks", "—", "Scheduling coming soon")
-    with d:
-        metric_card("AI credits", "—", "Usage tracking coming soon")
-
-    if not user_ready:
-        section("Get started", "Three steps to your first insight")
-        p1, p2, p3 = st.columns(3, gap="medium")
-        steps = [
-            ("01", "Connect a data source", "Authorize Google Analytics or HubSpot.", ready_count > 0, ready_count == 0),
-            ("02", "Choose what to analyze", "Select your GA4 property, if needed.", user_ready, ready_count > 0 and not user_ready),
-            ("03", "Ask your first question", "Use AI Chat for real answers from your account.", has_chat and user_ready, user_ready),
-        ]
-        for column, (number, title, detail, done, current) in zip((p1, p2, p3), steps):
-            with column:
-                css = 'done' if done else ('current' if current else '')
-                st.markdown(
-                    f'<div class="journey-step {css}">'
-                    f'<div class="journey-number">{number}  {"✓ COMPLETE" if done else ("CURRENT STEP" if current else "UP NEXT")}</div>'
-                    f'<div class="journey-title">{safe_html(title)}</div>'
-                    f'<div class="journey-desc">{safe_html(detail)}</div>'
-                    '</div>', unsafe_allow_html=True,
-                )
-        st.button("Continue setup →", key="overview_setup", use_container_width=False,
-                  on_click=navigate_to, args=("Integrations",))
-
-    section("At a glance", "Your workspace, recent activity and next steps")
-    left, right = st.columns([1, 1], gap="medium")
-    with left:
-        st.markdown('<div class="dashboard-panel">'
-                    '<div class="dashboard-panel-head">◷ Upcoming tasks</div>'
-                    '<div class="dashboard-panel-muted">No scheduled tasks yet. '
-                    'Once scheduling is enabled, your next reports and their delivery times will appear here.</div>'
-                    '<div style="margin-top:18px"><span class="status-pill status-violet">Planned feature</span></div>'
-                    '</div>', unsafe_allow_html=True)
-    with right:
-        recent = [m for m in st.session_state.get("messages", []) if m.get("role") == "user"][-3:]
-        lines = ''
-        for item in reversed(recent):
-            short = item.get("content", "").replace("\n", " ").strip()[:110]
-            lines += (
-                '<div class="activity-item"><span class="activity-mark">✧</span>'
-                '<div><div class="activity-copy">' + safe_html(short) + '</div>'
-                '<div class="activity-sub">AI Chat · This browser session</div></div></div>'
-            )
-        if not lines:
-            lines = ('<div class="dashboard-panel-muted">Your recent questions will appear here '
-                     'once you start chatting with your AI Employee.</div>')
-        st.markdown('<div class="dashboard-panel"><div class="dashboard-panel-head">↻ Recent activity</div>'
-                    + lines + '</div>', unsafe_allow_html=True)
-
-    section("Your connected workspace", "See what your AI Employee can work with")
-    with st.container(border=True):
-        if connection_errors:
-            st.warning("Some connection statuses couldn't be checked. Please try again.")
-        if active_connections:
-            st.success(f"{ready_count} data source(s) connected")
-            for name, config in APPS.items():
-                if config["toolkit"] in active_connections:
-                    st.markdown(f"**✓ {name}** · Connected")
-            if "google_analytics" in active_connections and not approved:
-                st.info("To analyze Google Analytics data, open Integrations and choose a property.")
-                st.button("Select GA4 property →", key="overview_ga4", on_click=navigate_to,
-                          args=("Integrations",))
-        else:
-            st.info("Connect Google Analytics or HubSpot to start using your own data.")
-            st.button("Browse integrations →", key="overview_browse", on_click=navigate_to,
-                      args=("Integrations",))
+    k1,k2,k3,k4 = st.columns(4, gap="medium")
+    with k1: metric_card("Connected sources", len(active_connections), "Available to your workspace")
+    with k2: metric_card("AI requests", format_tokens(usage["requests"]), "This month")
+    with k3: metric_card("AI tokens", format_tokens(usage["tokens"]), "This month")
+    with k4: metric_card("Est. AI cost", format_cost(usage["cost"]), "Paid-tier equivalent · this month")
+    section("AI activity", "A quick look at how your assistant is being used")
+    l,r = st.columns([1,1.18],gap="large")
+    with l:
+        with st.container(border=True):
+            st.markdown("**Monthly token breakdown**")
+            usage_donut(usage)
+    with r:
+        with st.container(border=True):
+            st.markdown("**Last 30 days**")
+            usage_daily_chart(usage_30)
+    section("What's next", "Upcoming work and recent activity")
+    l,r = st.columns(2, gap="large")
+    with l:
+        with st.container(border=True):
+            st.markdown("**Upcoming tasks**")
+            st.caption("No scheduled tasks yet. Task scheduling is being prepared.")
+            st.info("Scheduled reports and next delivery times will appear here.")
+    with r:
+        with st.container(border=True):
+            st.markdown("**Recent AI activity**")
+            if usage_30["rows"]:
+                # Show times and counts only: no prompt / business data exposed.
+                seen = set()
+                for row, timestamp in usage_30["rows"]:
+                    key = row.get("request_id") or row.get("id")
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    st.markdown(f"✦  AI request · {timestamp.strftime('%b %d, %I:%M %p')}")
+                    if len(seen) >= 4:
+                        break
+            else:
+                st.caption("Your first AI request will appear here.")
+    if connection_errors:
+        st.info("Some connections couldn't be checked just now.")
+    st.caption("Costs are indicative paid-tier Gemini token estimates, not actual charges. "
+               "Credits and full integration costs will be added when billing limits are ready.")
 
 
 def navigate_to(page):
@@ -1584,29 +1776,24 @@ def render_oauth_return():
     st.stop()
 
 
-def render_live_integration(name, config, accounts, error):
+def render_live_integration(name, config, accounts, error, active_connections):
     toolkit = config["toolkit"]
     with st.container(border=True):
-        description = {
+        desc = {
             "google_analytics": "Web analytics and user journeys",
             "hubspot": "CRM contacts, companies and deals",
         }.get(toolkit, "Business data connector")
-        integration_intro(name, LOGOS.get(name, toolkit), description, bool(accounts))
+        integration_intro(name, LOGOS.get(name, toolkit), desc, bool(accounts))
         st.markdown('<div style="height:5px"></div>', unsafe_allow_html=True)
         if error:
-            st.warning("Unable to check the connection.")
+            st.warning("Unable to check connection.")
         elif accounts:
-            if st.button(
-                "Manage connection", key=f"manage_{toolkit}", use_container_width=True
-            ):
-                st.session_state["manage_toolkit"] = (
-                    None if st.session_state.get("manage_toolkit") == toolkit else toolkit
-                )
+            # Popover is anchored to the card; no long settings form below the grid.
+            with st.popover("Manage connection", use_container_width=True):
+                render_connection_manager(toolkit, accounts, active_connections)
         else:
-            if st.button(
-                "Connect", key=f"connect_{toolkit}",
-                type="primary", use_container_width=True,
-            ):
+            if st.button("Connect", key=f"connect_{toolkit}",
+                         type="primary", use_container_width=True):
                 try:
                     link = create_connect_link(st.secrets[config["secret"]])
                     st.session_state.setdefault("connect_links", {})[toolkit] = link
@@ -1622,78 +1809,60 @@ def render_live_integration(name, config, accounts, error):
 
 
 def render_connection_manager(toolkit, accounts, active_connections):
-    name = next(n for n,c in APPS.items() if c["toolkit"] == toolkit)
-    st.divider()
-    section(f"Manage {name}", "Choose the connected account and configure the available data.")
+    """Contents of a native Streamlit popover inside the connected integration card."""
     if not accounts:
-        st.info("This account is not connected yet.")
+        st.caption("This source is not connected.")
         return
-    with st.container(border=True):
-        if len(accounts) > 1:
-            chosen_id = st.selectbox(
-                "Choose connected account", [a["id"] for a in accounts],
-                key="active_" + toolkit,
-            )
-            account = next(a for a in accounts if a["id"] == chosen_id)
-        else:
-            account = accounts[0]
-        active_connections[toolkit] = account
-        st.success(f"Connected · {len(accounts)} account(s)")
-        if toolkit == "google_analytics":
-            previous = st.session_state.get("ga4_property_connection")
-            if previous and previous != account["id"]:
+    if len(accounts) > 1:
+        ids = [a["id"] for a in accounts]
+        chosen = st.selectbox("Connected account", ids,
+                              format_func=lambda x: "Account " + str(ids.index(x)+1),
+                              key="active_" + toolkit)
+        account = next(a for a in accounts if a["id"] == chosen)
+    else:
+        account = accounts[0]
+        st.caption("One connected account")
+    active_connections[toolkit] = account
+    if toolkit == "google_analytics":
+        previous = st.session_state.get("ga4_property_connection")
+        if previous and previous != account["id"]:
+            clear_ga4_state()
+        if st.button("Load properties", key="load_ga4", use_container_width=True):
+            try:
+                with st.spinner("Loading properties..."):
+                    props = load_ga4_properties(account["id"])
                 clear_ga4_state()
-            if st.button("Load GA4 properties", type="primary", key="load_ga4"):
-                try:
-                    with st.spinner("Loading GA4 properties..."):
-                        props = load_ga4_properties(account["id"])
+                st.session_state["ga4_properties"] = props
+                st.session_state["ga4_property_connection"] = account["id"]
+            except (RuntimeError, KeyError) as err:
+                st.error(str(err))
+        properties = st.session_state.get("ga4_properties", [])
+        if properties and st.session_state.get("ga4_property_connection") == account["id"]:
+            options = {p["id"]: f'{p["account"]} / {p["name"]}' for p in properties}
+            st.multiselect("GA4 properties", list(options),
+                           format_func=lambda x: options[x], key="ga4_selected")
+            if st.button("Save selection", key="save_ga4", type="primary", use_container_width=True):
+                selected = st.session_state.get("ga4_selected", [])
+                if selected:
+                    st.session_state["approved_ga4_properties"] = list(selected)
+                    st.success(f"{len(selected)} properties saved")
+                else:
+                    st.warning("Select at least one property")
+            approved = st.session_state.get("approved_ga4_properties", [])
+            if approved:
+                st.caption(f"{len(approved)} properties available in AI Chat")
+    with st.expander("Disconnect"):
+        confirmed = st.checkbox("I want to disconnect", key=f"confirm_{account['id']}")
+        if st.button("Disconnect account", key=f"disconnect_{account['id']}",
+                     use_container_width=True, disabled=not confirmed):
+            try:
+                disconnect_account(account["id"], toolkit)
+                if toolkit == "google_analytics":
                     clear_ga4_state()
-                    st.session_state["ga4_properties"] = props
-                    st.session_state["ga4_property_connection"] = account["id"]
-                except (RuntimeError, KeyError) as err:
-                    st.error(str(err))
-            properties = st.session_state.get("ga4_properties", [])
-            if (properties and
-                st.session_state.get("ga4_property_connection") == account["id"]):
-                options = {
-                    p["id"]: f'{p["account"]} / {p["name"]} ({p["id"]})'
-                    for p in properties
-                }
-                st.caption(f"Found {len(options)} available GA4 properties")
-                # Saved options persist within this authenticated Streamlit session.
-                st.multiselect(
-                    "Properties to analyze", list(options),
-                    format_func=lambda x: options[x], key="ga4_selected",
-                )
-                if st.button("Save selection", key="save_ga4", type="primary"):
-                    selected = st.session_state.get("ga4_selected", [])
-                    if selected:
-                        st.session_state["approved_ga4_properties"] = list(selected)
-                        st.success(f"Saved {len(selected)} properties")
-                    else:
-                        st.warning("Choose at least one property")
-                approved = st.session_state.get("approved_ga4_properties", [])
-                if approved:
-                    st.info(f"{len(approved)} property/properties approved for AI Chat")
-        with st.expander("Disconnect account"):
-            confirmed = st.checkbox(
-                "I understand this will remove access to this connection",
-                key=f"confirm_{account['id']}",
-            )
-            if st.button(
-                "Disconnect", key=f"disconnect_{account['id']}",
-                disabled=not confirmed,
-            ):
-                try:
-                    disconnect_account(account["id"], toolkit)
-                    if toolkit == "google_analytics":
-                        clear_ga4_state()
-                    st.session_state["manage_toolkit"] = None
-                    st.session_state.get("connect_links", {}).pop(toolkit, None)
-                    st.success("Disconnected")
-                    st.rerun()
-                except RuntimeError as err:
-                    st.error(str(err))
+                st.session_state.get("connect_links", {}).pop(toolkit, None)
+                st.rerun()
+            except RuntimeError as err:
+                st.error(str(err))
 
 
 def render_integrations(accounts_by_toolkit, active_connections, errors):
@@ -1718,7 +1887,7 @@ def render_integrations(accounts_by_toolkit, active_connections, errors):
             render_live_integration(
                 name, config,
                 accounts_by_toolkit.get(config["toolkit"], []),
-                errors.get(config["toolkit"]),
+                errors.get(config["toolkit"]), active_connections,
             )
     with columns[len(APPS) % 3]:
         st.markdown(
@@ -1731,11 +1900,6 @@ def render_integrations(accounts_by_toolkit, active_connections, errors):
             '</div>', unsafe_allow_html=True,
         )
 
-    manager = st.session_state.get("manage_toolkit")
-    if manager in accounts_by_toolkit:
-        render_connection_manager(
-            manager, accounts_by_toolkit[manager], active_connections,
-        )
     section("Coming soon", "Reserved slots for future platforms — not yet connected")
     cols = st.columns(3, gap="medium")
     for i, (name, slug) in enumerate(UPCOMING_APPS):
@@ -1837,19 +2001,38 @@ def render_tasks():
     )
 
 
-def render_usage():
-    page_header("Usage & Credits", "Monitor API consumption and account-level costs.", tag="IN DEVELOPMENT")
-    a,b,c = st.columns(3,gap="medium")
-    with a: metric_card("AI token usage", "—", "Tracking not connected")
-    with b: metric_card("Estimated cost", "—", "No ledger written yet")
-    with c: metric_card("Credits remaining", "—", "Limits not configured")
-    section("Cost & credits")
-    empty_feature(
-        "◫", "Usage monitoring will appear here.",
-        "Next we'll record actual Gemini token usage and integration calls "
-        "per authenticated user, then add limits and cost reporting. "
-        "No cost values are being calculated by this screen today.",
-    )
+def render_usage(rows):
+    page_header("Usage", "Understand how your AI Employee is being used.", tag="YOUR ACTIVITY")
+    now, month_start, last_30 = cairo_periods()
+    summary = usage_summary(rows, month_start)
+    thirty = usage_summary(rows, last_30)
+    k1,k2,k3,k4 = st.columns(4, gap="medium")
+    with k1: metric_card("AI requests", format_tokens(summary["requests"]), "This month")
+    with k2: metric_card("Model calls", format_tokens(summary["api_calls"]), "All calls, including tool turns")
+    with k3: metric_card("Total tokens", format_tokens(summary["tokens"]), "This month")
+    with k4: metric_card("Est. AI cost", format_cost(summary["cost"]), "Paid-tier equivalent")
+    section("Usage trends", "Based on your own account activity")
+    left, right = st.columns([1,1.2], gap="large")
+    with left:
+        with st.container(border=True):
+            st.markdown("**Monthly token breakdown**")
+            usage_donut(summary)
+    with right:
+        with st.container(border=True):
+            st.markdown("**Last 30 days**")
+            usage_daily_chart(thirty)
+    section("Your usage details")
+    with st.container(border=True):
+        st.markdown(f"**Input tokens:** {format_tokens(summary['input'])}")
+        st.markdown(f"**Output tokens:** {format_tokens(summary['output'])}")
+        st.markdown(f"**Thinking tokens:** {format_tokens(summary['thinking'])}")
+        st.markdown(f"**Tool requests:** {format_tokens(summary['tools'])}")
+        st.caption("Tool requests count actions the model asked for. They are not Composio billable units.")
+        if summary["unpriced"]:
+            st.warning(f"{summary['unpriced']} model calls were missing usage metadata and are not priced.")
+    st.info("Cost figures use published paid-tier Gemini token rates. "
+            "They don't include Composio, hosting, taxes, or any free-tier allowances. "
+            "Credits and hard spending limits are not enabled yet.")
 
 
 def render_settings(user):
@@ -1892,8 +2075,15 @@ if "connect_links" not in st.session_state:
 active_connections, accounts_by_toolkit, connection_errors = load_connection_state()
 page = render_sidebar(user, active_connections)
 
+if page in ("Overview", "Usage"):
+    try:
+        usage_rows = fetch_usage_rows()
+    except RuntimeError:
+        st.error("Usage data is temporarily unavailable. Please check that your Supabase access is configured.")
+        st.stop()
+
 if page == "Overview":
-    render_overview(user, active_connections, connection_errors)
+    render_overview(user, active_connections, connection_errors, usage_rows)
 elif page == "AI Chat":
     render_ai_chat(active_connections)
 elif page == "My Tasks":
@@ -1901,6 +2091,6 @@ elif page == "My Tasks":
 elif page == "Integrations":
     render_integrations(accounts_by_toolkit, active_connections, connection_errors)
 elif page == "Usage":
-    render_usage()
+    render_usage(usage_rows)
 elif page == "Settings":
     render_settings(user)
