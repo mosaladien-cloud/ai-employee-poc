@@ -1332,6 +1332,82 @@ def get_available_tool_definitions(connections,
 
 
 # ==========================================
+# SLACK CHANNELS - USER-VERIFIED READ-ONLY DESTINATIONS
+# ==========================================
+
+@st.cache_data(ttl=120, show_spinner=False)
+def load_slack_channels(user_id, account_id):
+    """List available Slack channels for this authenticated user's connection."""
+    if usage_identity() != user_id:
+        raise RuntimeError("Sign in to access your channels.")
+    if account_id not in {item.get("id") for item in get_connections("slack")}:
+        raise RuntimeError("The Slack account is not connected to this workspace.")
+    definition = get_tool_definition("SLACK_LIST_CONVERSATIONS")
+    fields = (definition.get("input_parameters") or {}).get("properties") or {}
+    session_id = create_tool_session("slack", account_id)
+    found, cursor, seen = {}, "", set()
+    for _ in range(8):
+        args = {}
+        if "types" in fields:
+            value_type = fields["types"].get("type") if isinstance(fields["types"], dict) else ""
+            args["types"] = (["public_channel", "private_channel"]
+                             if value_type == "array" else "public_channel,private_channel")
+        if "limit" in fields:
+            args["limit"] = 200
+        if "exclude_archived" in fields:
+            args["exclude_archived"] = True
+        if cursor and "cursor" in fields:
+            args["cursor"] = cursor
+        response = composio_request(
+            "/tool_router/session/" + quote(session_id, safe="") + "/execute",
+            method="POST",
+            body={"tool_slug": "SLACK_LIST_CONVERSATIONS", "arguments": args},
+        )
+        if response.get("error") or response.get("result_type", "completed") != "completed":
+            raise RuntimeError("The Slack channel request failed.")
+        data = response.get("data", response)
+        for _ in range(5):
+            if not isinstance(data, dict):
+                break
+            if data.get("successful") is False or data.get("ok") is False:
+                raise RuntimeError("Slack did not authorize the channel request.")
+            if isinstance(data.get("channels"), list):
+                break
+            nested = next((data[k] for k in ("data", "result", "response")
+                           if isinstance(data.get(k), dict)), None)
+            if nested is None:
+                break
+            data = nested
+        if not isinstance(data, dict) or not isinstance(data.get("channels"), list):
+            raise RuntimeError("The channel list has an unexpected format.")
+        for item in data["channels"]:
+            if not isinstance(item, dict) or item.get("is_archived"):
+                continue
+            channel_id = str(item.get("id") or "")
+            name = str(item.get("name") or "")
+            if channel_id and name:
+                found[channel_id] = {
+                    "id": channel_id, "name": name,
+                    "private": bool(item.get("is_private")),
+                    "member": item.get("is_member"),
+                }
+        metadata = data.get("response_metadata") or {}
+        new_cursor = str((metadata.get("next_cursor") if isinstance(metadata, dict) else None)
+                         or data.get("next_cursor") or "")
+        if not new_cursor or new_cursor in seen or "cursor" not in fields:
+            break
+        seen.add(new_cursor)
+        cursor = new_cursor
+    return sorted(found.values(), key=lambda c: (c["private"], c["name"].lower()))
+
+
+def slack_delivery_target(account_id, channel_id):
+    """Store a destination with both IDs in the existing text field."""
+    return json.dumps({"account_id": account_id, "channel_id": channel_id},
+                      separators=(",", ":"))
+
+
+# ==========================================
 # GOOGLE ANALYTICS PROPERTIES
 # ==========================================
 
@@ -1819,6 +1895,9 @@ p {color:#53637a;}
 .info-row .info-val{font-size:14px;font-weight:700;color:#273751;margin-top:6px;overflow-wrap:anywhere;}
 .small-help{font-size:12px;line-height:1.8;color:#7d8a9d;}
 [data-testid="stVerticalBlockBorderWrapper"] {border-color:#e2e8f2!important;border-radius:15px!important;background:white;}
+/* Equal default size for available integration cards; OAuth controls can expand. */
+div[class*="st-key-integration_card_"] {min-height:195px;}
+div[class*="st-key-integration_card_"] [data-testid="stVerticalBlockBorderWrapper"] {min-height:195px;}
 [data-testid="stButton"] button[kind="primary"], [data-testid="stFormSubmitButton"] button[kind="primary"] {background:#4d55df;color:white;border:1px solid #4d55df;box-shadow:none;}
 [data-testid="stButton"] button[kind="primary"]:hover, [data-testid="stFormSubmitButton"] button[kind="primary"]:hover {background:#434cc7;border-color:#434cc7;color:#fff;}
 [data-testid="stButton"] button, [data-testid="stLinkButton"] a, [data-testid="stFormSubmitButton"] button {border-radius:9px;font-weight:650;font-size:12px;min-height:40px;}
@@ -2397,15 +2476,13 @@ def render_oauth_return():
 
 def render_live_integration(name, config, accounts, error, active_connections):
     toolkit = config["toolkit"]
-    with st.container(border=True):
+    with st.container(border=True, key="integration_card_" + toolkit):
         desc = {
             "google_analytics": "Web analytics and user journeys",
             "hubspot": "CRM contacts, companies and deals",
-            "slack": "Connect your workspace for reporting and collaboration",
+            "slack": "Team channels and report delivery",
         }.get(toolkit, "Business data connector")
         integration_intro(name, LOGOS.get(name, toolkit), desc, bool(accounts))
-        if toolkit == "slack":
-            st.caption("OAuth connection is available. Automatic report delivery is not active yet.")
         st.markdown('<div style="height:5px"></div>', unsafe_allow_html=True)
         if error:
             st.warning("Unable to check connection.")
@@ -2747,15 +2824,43 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                 else:
                     st.caption("No report result is available yet.")
     with right:
-        section("Report delivery", "Where completed reports will be sent")
+        section("Report delivery", "Choose a Slack channel for new reports")
+        selected_slack_target = None
         with st.container(border=True):
-            if "slack" in active_connections:
+            slack_account = active_connections.get("slack")
+            if slack_account:
                 st.success("Slack workspace connected")
-                st.caption("Your workspace is linked. Choosing a channel and sending reports are not active yet.")
+                try:
+                    channels = load_slack_channels(usage_identity(), slack_account["id"])
+                    if channels:
+                        by_id = {ch["id"]: ch for ch in channels}
+                        selected_channel = st.selectbox(
+                            "Slack channel", list(by_id),
+                            format_func=lambda cid: (
+                                ("🔒 " if by_id[cid]["private"] else "#")
+                                + by_id[cid]["name"]
+                                + (" · Invite app first" if by_id[cid]["member"] is False else "")
+                            ),
+                            key="task_slack_channel",
+                        )
+                        if by_id[selected_channel]["member"] is False:
+                            st.caption("Invite the connected Slack app to this channel before delivery.")
+                        else:
+                            selected_slack_target = slack_delivery_target(
+                                slack_account["id"], selected_channel)
+                        if st.button("Refresh channels", key="refresh_task_slack_channels"):
+                            load_slack_channels.clear(usage_identity(), slack_account["id"])
+                            st.rerun()
+                    else:
+                        st.warning("No accessible channels found in this workspace.")
+                except (RuntimeError, ValueError, KeyError, TypeError) as error:
+                    LOGGER.warning("Slack channel lookup failed: %s", str(error)[:220])
+                    st.warning("Couldn't load channels. Review the connection in Integrations.")
+                st.caption("The selected channel can be saved with a task. Sending is not enabled yet.")
                 button_text = "Manage Slack connection"
             else:
                 st.info("Slack is not connected")
-                st.caption("Link your Slack workspace from Integrations. You will be able to choose a channel once sending is enabled.")
+                st.caption("Connect your Slack workspace in Integrations to load the real channel list.")
                 button_text = "Connect Slack"
             if st.button(button_text, key="tasks_slack_integration", use_container_width=True):
                 navigate_to("Integrations")
@@ -2779,12 +2884,19 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                 st.write("**Instructions:**",draft["instructions"])
                 st.write("**Repeat:**",draft["schedule_type"].title())
                 st.caption("First run: tomorrow at 9 AM (Cairo). You can edit the schedule later.")
+                ai_delivery = st.selectbox(
+                    "Destination",
+                    ["none"] + (["slack"] if selected_slack_target else []),
+                    format_func=lambda d: "Save in workspace" if d == "none"
+                    else "Selected Slack channel (delivery coming soon)",
+                    key="ai_task_delivery",
+                )
                 if st.button("Approve and save task",key="approve_ai_task",use_container_width=True):
                     tomorrow=datetime.now(CAIRO).date()+timedelta(days=1)
                     try:
                         save_planned_task(draft["title"],draft["instructions"],draft["schedule_type"],
                             tomorrow,datetime.now(CAIRO).replace(hour=9,minute=0,second=0,microsecond=0).time(),
-                            "none",None)
+                            ai_delivery, selected_slack_target if ai_delivery=="slack" else None)
                         st.session_state.pop("agent_task_draft",None)
                         st.success("Task saved to your workspace.")
                         st.rerun()
@@ -2802,9 +2914,12 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                     planned_date=st.date_input("First date",value=datetime.now(CAIRO).date()+timedelta(days=1))
                 with time_col:
                     planned_time=st.time_input("Time (Cairo)",value=datetime.now(CAIRO).replace(hour=9,minute=0,second=0,microsecond=0).time())
-                delivery=st.selectbox("Delivery",["none","email","slack"],
-                    format_func=lambda x:{"none":"Save in workspace","email":"Email (coming later)","slack":"Slack (delivery coming later)"}[x])
-                destination=st.text_input("Destination (optional)")
+                delivery_options = ["none","email"] + (["slack"] if selected_slack_target else [])
+                delivery=st.selectbox("Delivery",delivery_options,
+                    format_func=lambda x:{"none":"Save in workspace","email":"Email (coming later)","slack":"Selected Slack channel (delivery coming soon)"}[x])
+                destination = (st.text_input("Recipient email (planned only)")
+                               if delivery=="email" else
+                               selected_slack_target if delivery=="slack" else None)
                 submit=st.form_submit_button("Save task plan",type="primary",use_container_width=True)
             if submit:
                 try:
@@ -2812,7 +2927,7 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                     st.rerun()
                 except ValueError as error:st.warning(str(error))
                 except RuntimeError:st.error("Couldn't save your task right now.")
-            st.caption("Tasks are saved as drafts until activated. Selecting Slack here only saves a plan; no message is sent yet.")
+            st.caption("Tasks are saved as drafts until activated. A Slack channel selection is only a plan; no message is sent yet.")
 
 
 def render_usage(rows, usage_error=None, credit_status=None, credit_error=None):
