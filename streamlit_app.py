@@ -4,6 +4,7 @@ import json
 import logging
 import time
 import html
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -949,10 +950,28 @@ def save_planned_task(title, instructions, schedule_type, local_date,
         delivery_target = None
     else:
         delivery_target = (delivery_target or "").strip()
-        if not delivery_target or len(delivery_target) > 250:
-            raise ValueError("Enter your planned delivery destination.")
-        if delivery_type == "email" and ("@" not in delivery_target or " " in delivery_target):
-            raise ValueError("Enter a valid delivery email address.")
+        if not delivery_target or len(delivery_target) > 1600:
+            raise ValueError("Choose a valid delivery destination.")
+        if delivery_type == "email":
+            # Always store the actual Gmail connected account and up to five
+            # independently validated recipients, never a free-text prompt.
+            try:
+                parsed = json.loads(delivery_target)
+            except (TypeError, ValueError):
+                raise ValueError("Choose Gmail and enter recipient addresses.") from None
+            if not isinstance(parsed, dict):
+                raise ValueError("Invalid Gmail destination.")
+            account_id = parsed.get("account_id")
+            recipients = parsed.get("recipients")
+            if not isinstance(account_id, str) or not isinstance(recipients, list):
+                raise ValueError("Choose a connected Gmail account and recipients.")
+            normalized = validate_gmail_recipients(recipients)
+            if account_id not in {item.get("id") for item in get_connections("gmail")}:
+                raise ValueError("Reconnect Gmail in Integrations before saving this task.")
+            delivery_target = json.dumps(
+                {"account_id": account_id, "recipients": normalized},
+                separators=(",", ":"),
+            )
     next_local = datetime.combine(local_date, local_time).replace(tzinfo=CAIRO)
     if next_local <= datetime.now(CAIRO):
         raise ValueError("Choose a future date and time.")
@@ -1408,6 +1427,39 @@ def load_slack_channels(user_id, account_id):
 def slack_delivery_target(account_id, channel_id):
     """Store a destination with both IDs in the existing text field."""
     return json.dumps({"account_id": account_id, "channel_id": channel_id},
+                      separators=(",", ":"))
+
+
+# ==========================================
+# GMAIL RECIPIENTS - TASK DELIVERY PREFERENCES
+# ==========================================
+
+def validate_gmail_recipients(recipients):
+    """Validate up to five addresses independently (no send permission here)."""
+    if not isinstance(recipients, list) or not 1 <= len(recipients) <= 5:
+        raise ValueError("Add 1 to 5 recipient email addresses.")
+    cleaned = []
+    for value in recipients:
+        if not isinstance(value, str):
+            raise ValueError("Enter valid email addresses.")
+        address = value.strip().lower()
+        if len(address) > 254 or not re.fullmatch(
+            r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+",
+            address
+        ):
+            raise ValueError(f"Invalid recipient email: {value[:60]}")
+        if address in cleaned:
+            raise ValueError("Remove duplicate recipient addresses.")
+        cleaned.append(address)
+    return cleaned
+
+
+def gmail_delivery_target(account_id, recipients):
+    """Existing tasks.delivery_target text column supports a JSON payload."""
+    cleaned = validate_gmail_recipients(recipients)
+    if not isinstance(account_id, str) or not account_id:
+        raise ValueError("Connect your Gmail account first.")
+    return json.dumps({"account_id": account_id, "recipients": cleaned},
                       separators=(",", ":"))
 
 
@@ -2872,19 +2924,35 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                 navigate_to("Integrations")
                 st.rerun()
             st.caption("Automatic Slack sending is coming soon.")
+        selected_gmail_target = None
         with st.container(border=True):
-            if active_connections.get("gmail"):
+            gmail_account = active_connections.get("gmail")
+            if gmail_account:
                 st.success("Gmail account connected")
-                st.caption("Reports will be able to send from your linked Gmail account after email delivery is enabled.")
+                recipients = st.multiselect(
+                    "Recipient emails", options=[],
+                    accept_new_options=True, max_selections=5,
+                    placeholder="Type an email address and press Enter",
+                    key="task_gmail_recipients",
+                    help="Add up to five recipients. They do not need Gmail accounts.",
+                )
+                if recipients:
+                    try:
+                        selected_gmail_target = gmail_delivery_target(
+                            gmail_account["id"], recipients)
+                    except ValueError as error:
+                        st.warning(str(error))
+                else:
+                    st.caption("Add at least one recipient to select Gmail for a new report.")
                 gmail_button = "Manage Gmail connection"
             else:
                 st.info("Gmail is not connected")
-                st.caption("Link your Gmail account in Integrations to prepare for email delivery.")
+                st.caption("Connect Gmail in Integrations, then add report recipients here.")
                 gmail_button = "Connect Gmail"
             if st.button(gmail_button, key="tasks_gmail_integration", use_container_width=True):
                 navigate_to("Integrations")
                 st.rerun()
-            st.caption("Gmail sending and WhatsApp delivery are not active yet.")
+            st.caption("Recipient selections can be saved with new tasks. Actual email sending is not enabled yet.")
         section("Create a report","Describe it in your own words or fill in the details")
         with st.container(border=True):
             description=st.text_area("What would you like your AI Employee to do?",
@@ -2903,19 +2971,27 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                 st.write("**Instructions:**",draft["instructions"])
                 st.write("**Repeat:**",draft["schedule_type"].title())
                 st.caption("First run: tomorrow at 9 AM (Cairo). You can edit the schedule later.")
+                ai_delivery_options = (
+                    ["none"]
+                    + (["slack"] if selected_slack_target else [])
+                    + (["email"] if selected_gmail_target else [])
+                )
                 ai_delivery = st.selectbox(
-                    "Destination",
-                    ["none"] + (["slack"] if selected_slack_target else []),
-                    format_func=lambda d: "Save in workspace" if d == "none"
-                    else "Selected Slack channel (delivery coming soon)",
-                    key="ai_task_delivery",
+                    "Destination", ai_delivery_options,
+                    format_func=lambda d: {
+                        "none": "Save in workspace",
+                        "slack": "Selected Slack channel (sending coming soon)",
+                        "email": "Gmail recipients (sending coming soon)",
+                    }[d], key="ai_task_delivery",
                 )
                 if st.button("Approve and save task",key="approve_ai_task",use_container_width=True):
                     tomorrow=datetime.now(CAIRO).date()+timedelta(days=1)
                     try:
                         save_planned_task(draft["title"],draft["instructions"],draft["schedule_type"],
                             tomorrow,datetime.now(CAIRO).replace(hour=9,minute=0,second=0,microsecond=0).time(),
-                            ai_delivery, selected_slack_target if ai_delivery=="slack" else None)
+                            ai_delivery,
+                            (selected_slack_target if ai_delivery=="slack" else
+                             selected_gmail_target if ai_delivery=="email" else None))
                         st.session_state.pop("agent_task_draft",None)
                         st.success("Task saved to your workspace.")
                         st.rerun()
@@ -2933,12 +3009,21 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                     planned_date=st.date_input("First date",value=datetime.now(CAIRO).date()+timedelta(days=1))
                 with time_col:
                     planned_time=st.time_input("Time (Cairo)",value=datetime.now(CAIRO).replace(hour=9,minute=0,second=0,microsecond=0).time())
-                delivery_options = ["none","email"] + (["slack"] if selected_slack_target else [])
+                delivery_options = (
+                    ["none"]
+                    + (["slack"] if selected_slack_target else [])
+                    + (["email"] if selected_gmail_target else [])
+                )
                 delivery=st.selectbox("Delivery",delivery_options,
-                    format_func=lambda x:{"none":"Save in workspace","email":"Email (coming later)","slack":"Selected Slack channel (delivery coming soon)"}[x])
-                destination = (st.text_input("Recipient email (planned only)")
-                               if delivery=="email" else
-                               selected_slack_target if delivery=="slack" else None)
+                    format_func=lambda x:{
+                        "none":"Save in workspace",
+                        "email":"Gmail recipients (sending coming soon)",
+                        "slack":"Selected Slack channel (sending coming soon)",
+                    }[x])
+                destination = (
+                    selected_gmail_target if delivery=="email" else
+                    selected_slack_target if delivery=="slack" else None
+                )
                 submit=st.form_submit_button("Save task plan",type="primary",use_container_width=True)
             if submit:
                 try:
@@ -2946,7 +3031,7 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                     st.rerun()
                 except ValueError as error:st.warning(str(error))
                 except RuntimeError:st.error("Couldn't save your task right now.")
-            st.caption("Tasks are saved as drafts until activated. A Slack channel selection is only a plan; no message is sent yet.")
+            st.caption("Tasks are saved as drafts until activated. Email/Slack selections are preferences only; no messages are sent yet.")
 
 
 def render_usage(rows, usage_error=None, credit_status=None, credit_error=None):
