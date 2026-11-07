@@ -1,5 +1,6 @@
 import json
 import time
+import html
 import urllib.request
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, quote
@@ -14,7 +15,8 @@ import streamlit as st
 st.set_page_config(
     page_title="AI Employee",
     page_icon="🤖",
-    layout="centered",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
 APP_URL = "https://ai-employee-poc.streamlit.app"
@@ -157,6 +159,7 @@ def clear_user_workspace():
         "active_ga4_property", "messages", "authenticated_user",
         "verified_user_id", "active_google_analytics",
         "active_hubspot", "load_ga4", "auth_notice",
+        "nav_page", "manage_toolkit",
     )
     for key in keys:
         st.session_state.pop(key, None)
@@ -260,81 +263,100 @@ def composio_user_id():
 
 
 def render_login():
-    st.title("🤖 AI Employee")
-    st.caption("Private beta · Secure workspace")
-    st.info("Sign in or create a test account to access your own integrations.")
-
-    tab_signin, tab_signup = st.tabs(["Sign In", "Create Account"])
-
-    with tab_signin:
-        with st.form("signin_form", clear_on_submit=False):
-            email = st.text_input("Email", key="signin_email").strip().lower()
-            password = st.text_input(
-                "Password", type="password", key="signin_password"
-            )
-            submit = st.form_submit_button("Sign In", type="primary")
-
-        if submit:
-            if not email or not password:
-                st.error("Enter your email and password.")
-            else:
-                try:
-                    data = auth_request(
-                        "/token", query={"grant_type": "password"},
-                        body={"email": email, "password": password},
-                    )
-                    save_auth_tokens(data)
-                    st.rerun()
-                except RuntimeError as error:
-                    st.error(str(error))
-
-    with tab_signup:
-        with st.form("signup_form", clear_on_submit=False):
-            new_email = st.text_input(
-                "Email", key="signup_email"
-            ).strip().lower()
-            new_password = st.text_input(
-                "Password (at least 8 characters)",
-                type="password", key="signup_password",
-            )
-            confirm_password = st.text_input(
-                "Confirm password", type="password",
-                key="signup_confirm_password",
-            )
-            signup = st.form_submit_button("Create Account")
-
-        if signup:
-            if not new_email or "@" not in new_email:
-                st.error("Enter a valid email address.")
-            elif len(new_password) < 8:
-                st.error("Use a password with at least 8 characters.")
-            elif new_password != confirm_password:
-                st.error("Passwords do not match.")
-            else:
-                try:
-                    result = auth_request(
-                        "/signup",
-                        body={
-                            "email": new_email,
-                            "password": new_password,
-                        },
-                    )
-                    if result.get("access_token"):
-                        save_auth_tokens(result)
-                        st.rerun()
-                    else:
-                        st.success(
-                            "If signup is accepted, check your inbox "
-                            "for a confirmation link. Then come back "
-                            "and sign in using your email and password."
-                        )
-                except RuntimeError as error:
-                    st.error(str(error))
-
-    st.caption(
-        "Email confirmation opens the app, but this prototype "
-        "requires you to sign in manually after confirmation."
+    # Login screen uses the same visual language as the app.
+    st.sidebar.markdown(
+        '<div class="brand-lockup"><span class="brand-symbol">✦</span>'
+        '<span><strong>AI Employee</strong><small>Private beta</small></span></div>',
+        unsafe_allow_html=True,
     )
+    st.sidebar.markdown(
+        '<div class="sidebar-note">Your data. Your AI analyst.<br>'
+        'A dedicated workspace for each account.</div>',
+        unsafe_allow_html=True,
+    )
+
+    left, center, right = st.columns([1, 1.25, 1])
+    with center:
+        st.markdown('<div class="login-spacer"></div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="eyebrow">YOUR AI WORKSPACE</div>'
+            '<div class="page-title">Welcome to AI Employee</div>'
+            '<div class="page-description">Access your integrations, analytics '
+            'and AI assistant in one secure workspace.</div>',
+            unsafe_allow_html=True,
+        )
+        with st.container(border=True):
+            tab_signin, tab_signup = st.tabs(["Sign in", "Create account"])
+
+            with tab_signin:
+                with st.form("signin_form", clear_on_submit=False):
+                    email = st.text_input("Email address", key="signin_email").strip().lower()
+                    password = st.text_input(
+                        "Password", type="password", key="signin_password"
+                    )
+                    submit = st.form_submit_button(
+                        "Sign in to workspace", type="primary", use_container_width=True
+                    )
+                if submit:
+                    if not email or not password:
+                        st.error("Enter your email and password.")
+                    else:
+                        try:
+                            data = auth_request(
+                                "/token", query={"grant_type": "password"},
+                                body={"email": email, "password": password},
+                            )
+                            save_auth_tokens(data)
+                            st.rerun()
+                        except RuntimeError as error:
+                            st.error(str(error))
+
+            with tab_signup:
+                with st.form("signup_form", clear_on_submit=False):
+                    new_email = st.text_input(
+                        "Email address", key="signup_email"
+                    ).strip().lower()
+                    new_password = st.text_input(
+                        "Password (minimum 8 characters)",
+                        type="password", key="signup_password",
+                    )
+                    confirm_password = st.text_input(
+                        "Confirm password", type="password",
+                        key="signup_confirm_password",
+                    )
+                    signup = st.form_submit_button(
+                        "Create account", type="primary", use_container_width=True
+                    )
+                if signup:
+                    if not new_email or "@" not in new_email:
+                        st.error("Enter a valid email address.")
+                    elif len(new_password) < 8:
+                        st.error("Use a password with at least 8 characters.")
+                    elif new_password != confirm_password:
+                        st.error("Passwords do not match.")
+                    else:
+                        try:
+                            result = auth_request(
+                                "/signup",
+                                body={
+                                    "email": new_email,
+                                    "password": new_password,
+                                },
+                            )
+                            if result.get("access_token"):
+                                save_auth_tokens(result)
+                                st.rerun()
+                            else:
+                                st.success(
+                                    "Check your inbox for a confirmation link, "
+                                    "then return to sign in."
+                                )
+                        except RuntimeError as error:
+                            st.error(str(error))
+        st.caption(
+            "Private beta · Email confirmation may be required. "
+            "Sign in manually after confirming your email."
+        )
 
 
 # ==========================================
@@ -995,326 +1017,660 @@ when comparisons need multiple queries.
 
 
 # ==========================================
-# MAIN APP
+# PRESENTATION / THEME
 # ==========================================
 
-# Authentication is a hard gate: no Composio or Gemini call before verification.
+# No extra Python packages are needed: styling is plain CSS,
+# while every real action remains a native Streamlit widget.
+STYLE = r"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap');
+:root {--navy:#152238;--indigo:#4f46e5;--body:#202d43;--muted:#708099;--outline:#e6eaf1;--surface:#f7f9fc;}
+html, body, [data-testid="stApp"], [data-testid="stAppViewContainer"] {
+  background:#f7f9fc; font-family:'DM Sans', 'Segoe UI', sans-serif;
+}
+[data-testid="stHeader"] {background:rgba(247,249,252,.94);border-bottom:1px solid #edf0f5;}
+[data-testid="stToolbar"] {color:#6d7b90;}
+.block-container {max-width:1480px;padding-top:2.3rem;padding-bottom:3.5rem;padding-left:2.7rem;padding-right:2.7rem;}
+h1,h2,h3,h4,p,div,label,button,input {font-family:'DM Sans', 'Segoe UI', sans-serif;}
+h1,h2,h3 {letter-spacing:-.025em;color:#1c2940;}
+p {color:#53637a;}
+[data-testid="stSidebar"] {background:linear-gradient(180deg,#142138 0%,#1a2943 100%);border-right:1px solid #253654;}
+[data-testid="stSidebar"] [data-testid="stSidebarContent"] {padding:1.1rem .8rem;}
+[data-testid="stSidebar"] * {color:#d9e3f3;}
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {color:#d9e3f3;}
+[data-testid="stSidebar"] [data-testid="stWidgetLabel"] {color:#9aacc6;}
+[data-testid="stSidebar"] [role="radiogroup"] {gap:.28rem;}
+[data-testid="stSidebar"] [role="radiogroup"] label {
+  padding:10px 12px;min-height:41px;border-radius:10px;
+  transition:background .15s ease;border:1px solid transparent;
+}
+[data-testid="stSidebar"] [role="radiogroup"] label:hover {background:rgba(255,255,255,.07);}
+[data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) {background:#344667;border-color:#465d82;}
+[data-testid="stSidebar"] [role="radiogroup"] label div[role="radiogroup"] {display:none;}
+[data-testid="stSidebar"] button {border-radius:9px;border:1px solid #455675;background:#263955;color:#f3f7ff;}
+[data-testid="stSidebar"] button:hover {border-color:#8395ff;background:#334a6e;color:white;}
+[data-testid="stSidebar"] hr {border-color:#34445c;}
+.brand-lockup {display:flex;gap:11px;align-items:center;margin:16px 0 30px 3px;}
+.brand-lockup strong {display:block;color:#fff;font-size:17px;letter-spacing:-.5px;line-height:1.3;}
+.brand-lockup small {display:block;color:#aab8ce;font-size:11px;margin-top:2px;letter-spacing:.1em;text-transform:uppercase;}
+.brand-symbol {width:38px;height:38px;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#596bff,#8075ff);color:#fff;font-size:25px;font-weight:700;border-radius:12px;box-shadow:0 7px 22px #0002;}
+.sidebar-label {font-size:10px;font-weight:800;letter-spacing:.15em;color:#8399b7!important;margin:10px 0 12px 7px;}
+.sidebar-note {border:1px solid #35455f;background:#22334f;color:#b7c7df;font-size:12px;line-height:1.75;border-radius:12px;padding:13px 14px;margin:1rem 0;}
+.sidebar-profile {border-top:1px solid #33445f;padding:15px 2px 5px;font-size:12px;line-height:1.65;color:#cdd8ea;}
+.sidebar-profile .avatar {display:inline-grid;place-items:center;width:33px;height:33px;margin-right:7px;border-radius:10px;background:#5265e8;color:white;font-weight:800;}
+.sidebar-profile strong {color:white;}
+.sidebar-profile .email {display:block;color:#95a9c6;overflow-wrap:anywhere;margin:5px 0;}
+.login-spacer {height:9vh;}
+.eyebrow {color:#605ff4;font-size:11px;font-weight:800;letter-spacing:.15em;margin:0 0 8px;}
+.page-title {font-size:32px;line-height:1.18;font-weight:800;color:#1a2840;letter-spacing:-.05em;margin:3px 0 7px;}
+.page-description {font-size:14px;color:#738198;line-height:1.7;margin:0 0 22px;max-width:850px;}
+.page-top {display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin:4px 0 23px;}
+.header-pill {font-size:11px;font-weight:750;background:#e8edff;color:#4f46e5;border:1px solid #dce4ff;border-radius:30px;padding:7px 13px;}
+.hero-card {border-radius:18px;background:linear-gradient(112deg,#172844 0%,#2e3c77 75%,#5455bf 100%);color:#fff;padding:30px 34px;margin:0 0 22px;box-shadow:0 16px 40px rgba(35,50,110,.1);}
+.hero-card h2{margin:5px 0 11px;color:#fff;font-weight:800;letter-spacing:-.035em;font-size:25px;}
+.hero-card p{margin:0;color:#ced9f1;max-width:740px;font-size:13px;line-height:1.85;}
+.hero-card .hero-kicker{color:#aabdfd;font-size:11px;letter-spacing:.13em;font-weight:800;text-transform:uppercase;}
+.metric-card {background:white;border:1px solid var(--outline);border-radius:15px;padding:21px 21px 19px;min-height:135px;box-shadow:0 2px 13px rgba(35,51,86,.025);}
+.metric-label {font-size:12px;color:#77849b;font-weight:600;letter-spacing:.01em;}
+.metric-value {color:#1b2940;font-size:31px;font-weight:800;letter-spacing:-.055em;line-height:1.25;margin:12px 0 5px;}
+.metric-foot {font-size:11px;color:#8c98a9;}
+.section-title {color:#26334a;font-size:16px;font-weight:800;letter-spacing:-.02em;margin:25px 0 9px;}
+.section-muted {color:#8795aa;font-size:12px;margin-bottom:17px;}
+.status-pill {display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:750;line-height:1.2;border-radius:25px;padding:6px 10px;}
+.status-green{background:#eaf9ef;color:#208553;}.status-gray{background:#f0f3f7;color:#708099;}.status-violet{background:#f0edff;color:#6553c3;}
+.status-dot{width:6px;height:6px;background:currentColor;border-radius:50%;display:inline-block;}
+.integration-head {display:flex;align-items:center;gap:12px;margin:0 0 14px;min-height:52px;}
+.integration-logo {display:flex;align-items:center;justify-content:center;width:51px;height:51px;background:#f6f8fc;border:1px solid #eaf0f8;border-radius:13px;flex-shrink:0;}
+.integration-logo img{width:30px;height:30px;object-fit:contain;}
+.integration-name{font-weight:800;font-size:15px;color:#213048;letter-spacing:-.02em;}
+.integration-desc{font-size:11px;color:#8390a4;margin-top:3px;line-height:1.4;}
+.integration-foot{font-size:11px;color:#8a98aa;margin-top:11px;min-height:20px;}
+.soon-card{border-radius:14px;border:1px solid #e7eaf2;background:white;min-height:140px;padding:20px;margin-bottom:13px;box-shadow:0 2px 8px #1d2d4504;}
+.soon-top {display:flex;align-items:center;gap:12px;margin-bottom:16px;}
+.soon-logo {width:43px;height:43px;background:#f8f9fd;border:1px solid #edf0f5;border-radius:12px;display:flex;align-items:center;justify-content:center;}
+.soon-logo img{height:24px;width:24px;object-fit:contain;opacity:.82;}
+.soon-name{color:#29374d;font-size:13px;font-weight:750;}
+.placeholder-box{background:#fff;border:1px dashed #ccd5e6;border-radius:16px;padding:25px 29px;color:#66758d;margin:6px 0 15px;line-height:1.9;}
+.placeholder-box strong{color:#2b3952;display:block;margin-bottom:4px;}
+.placeholder-icon{display:grid;place-items:center;width:47px;height:47px;background:#eff2ff;color:#5858d6;border-radius:14px;font-size:24px;margin-bottom:14px;}
+.info-row{background:white;border:1px solid #e5eaf2;border-radius:14px;padding:17px 20px;margin:12px 0;}
+.info-row .info-label{font-size:11px;color:#8b98a9;}
+.info-row .info-val{font-size:14px;font-weight:700;color:#273751;margin-top:6px;overflow-wrap:anywhere;}
+.small-help{font-size:12px;line-height:1.8;color:#7d8a9d;}
+[data-testid="stVerticalBlockBorderWrapper"] {border-color:#e2e8f2!important;border-radius:15px!important;background:white;}
+[data-testid="stButton"] button[kind="primary"], [data-testid="stFormSubmitButton"] button[kind="primary"] {background:#4d55df;color:white;border:1px solid #4d55df;box-shadow:none;}
+[data-testid="stButton"] button[kind="primary"]:hover, [data-testid="stFormSubmitButton"] button[kind="primary"]:hover {background:#434cc7;border-color:#434cc7;color:#fff;}
+[data-testid="stButton"] button, [data-testid="stLinkButton"] a, [data-testid="stFormSubmitButton"] button {border-radius:9px;font-weight:650;font-size:12px;min-height:40px;}
+[data-testid="stButton"] button:hover {border-color:#7370ed;color:#4e52b7;}
+[data-testid="stAlert"]{border-radius:12px;}
+[data-testid="stChatMessage"]{border:1px solid #e8ecf3;border-radius:13px;background:white;margin-bottom:9px;padding:8px 10px;}
+[data-testid="stChatInput"]{border-radius:12px;}
+[data-testid="stMetric"]{background:white;border:1px solid #e7ebf2;border-radius:13px;padding:16px;}
+@media (max-width:900px){.block-container{padding-left:1rem;padding-right:1rem;padding-top:1.3rem;}.page-title{font-size:26px;}.hero-card{padding:22px;}}
+</style>
+"""
+
+
+# Catalog placeholders are VISUAL ONLY. They never create links or execute tools.
+# Add a real integration to APPS and ALLOWED_TOOLS only after configuring,
+# testing and approving it in Composio. Do not treat these as active connectors.
+UPCOMING_APPS = [
+    ("Google Ads", "googleads"),
+    ("Meta Ads", "meta"),
+    ("Microsoft Ads", "microsoft"),
+    ("LinkedIn Ads", "linkedin"),
+    ("Google Search Console", "googlesearchconsole"),
+    ("Shopify", "shopify"),
+    ("Klaviyo", "klaviyo"),
+    ("Salesforce", "salesforce"),
+    ("Slack", "slack"),
+    ("Gmail", "gmail"),
+    ("Google Sheets", "googlesheets"),
+    ("TikTok", "tiktok"),
+    ("Mailchimp", "mailchimp"),
+    ("Stripe", "stripe"),
+    ("BigQuery", "googlebigquery"),
+]
+
+LOGOS = {
+    "Google Analytics": "googleanalytics",
+    "HubSpot": "hubspot",
+}
+
+
+def logo_url(slug):
+    # Simple Icons CDN: public brand icons, not a new Python dependency.
+    return f"https://cdn.simpleicons.org/{quote(slug, safe='')}"
+
+
+def safe_html(value):
+    return html.escape(str(value), quote=True)
+
+
+def inject_theme():
+    st.markdown(STYLE, unsafe_allow_html=True)
+
+
+def section(title, subtitle=None):
+    st.markdown(f'<div class="section-title">{safe_html(title)}</div>', unsafe_allow_html=True)
+    if subtitle:
+        st.markdown(
+            f'<div class="section-muted">{safe_html(subtitle)}</div>',
+            unsafe_allow_html=True,
+        )
+
+
+def page_header(title, description, tag="PRIVATE BETA"):
+    st.markdown(
+        '<div class="page-top"><div>'
+        '<div class="eyebrow">AI EMPLOYEE WORKSPACE</div>'
+        f'<div class="page-title">{safe_html(title)}</div>'
+        f'<div class="page-description">{safe_html(description)}</div>'
+        '</div>'
+        f'<span class="header-pill">{safe_html(tag)}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def metric_card(label, value, foot):
+    st.markdown(
+        '<div class="metric-card">'
+        f'<div class="metric-label">{safe_html(label)}</div>'
+        f'<div class="metric-value">{safe_html(value)}</div>'
+        f'<div class="metric-foot">{safe_html(foot)}</div>'
+        '</div>', unsafe_allow_html=True,
+    )
+
+
+def empty_feature(icon, title, detail):
+    st.markdown(
+        '<div class="placeholder-box">'
+        f'<div class="placeholder-icon">{safe_html(icon)}</div>'
+        f'<strong>{safe_html(title)}</strong>'
+        f'{safe_html(detail)}'
+        '</div>', unsafe_allow_html=True,
+    )
+
+
+def status_badge(connected, small=False):
+    label = "Connected" if connected else "Not connected"
+    style = "status-green" if connected else "status-gray"
+    return (
+        f'<span class="status-pill {style}">'
+        f'<span class="status-dot"></span>{label}</span>'
+    )
+
+
+def integration_intro(name, logo, description, connected):
+    st.markdown(
+        '<div class="integration-head">'
+        '<div class="integration-logo">'
+        f'<img src="{safe_html(logo_url(logo))}" alt="{safe_html(name)} logo">'
+        '</div><div>'
+        f'<div class="integration-name">{safe_html(name)}</div>'
+        f'<div class="integration-desc">{safe_html(description)}</div>'
+        '</div></div>'
+        f'{status_badge(connected)}', unsafe_allow_html=True,
+    )
+
+
+def load_connection_state():
+    active = {}
+    accounts_by_toolkit = {}
+    errors = {}
+    for config in APPS.values():
+        toolkit = config["toolkit"]
+        try:
+            accounts = get_connections(toolkit)
+        except (RuntimeError, KeyError, TypeError) as error:
+            errors[toolkit] = str(error)
+            accounts = []
+        accounts_by_toolkit[toolkit] = accounts
+        if accounts:
+            selected_id = st.session_state.get("active_" + toolkit)
+            selected = next((a for a in accounts if a["id"] == selected_id), None)
+            active[toolkit] = selected or accounts[0]
+    # Clear GA4 options only if the connected account truly changed or was removed;
+    # do NOT clear settings when Composio temporarily errors.
+    ga4 = active.get("google_analytics")
+    if "google_analytics" not in errors:
+        previous = st.session_state.get("ga4_property_connection")
+        if ga4 and previous and previous != ga4["id"]:
+            clear_ga4_state()
+        if not ga4:
+            clear_ga4_state()
+    return active, accounts_by_toolkit, errors
+
+
+def render_sidebar(user, current_connections):
+    with st.sidebar:
+        st.markdown(
+            '<div class="brand-lockup"><span class="brand-symbol">✦</span>'
+            '<span><strong>AI Employee</strong><small>Analytics workspace</small></span></div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown('<div class="sidebar-label">WORKSPACE</div>', unsafe_allow_html=True)
+        page = st.radio(
+            "Navigation",
+            ["Overview", "AI Chat", "My Tasks", "Integrations", "Usage", "Settings"],
+            format_func=lambda x: {
+                "Overview": "▦   Overview",
+                "AI Chat": "✧   AI Chat",
+                "My Tasks": "☑   My Tasks",
+                "Integrations": "⛓   Integrations",
+                "Usage": "◫   Usage",
+                "Settings": "⚙   Settings",
+            }[x],
+            label_visibility="collapsed",
+            key="nav_page",
+        )
+        st.divider()
+        st.markdown(
+            '<div class="sidebar-note">'
+            '<strong style="color:white">Private beta</strong><br>'
+            'Connect sources and analyze live data. Tasks and usage tracking '
+            'are being added next.</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            '<div class="sidebar-profile">'
+            '<span class="avatar">' + safe_html((user.get("email") or "U")[0].upper()) + '</span>'
+            '<strong>My Workspace</strong>'
+            '<span class="email">' + safe_html(user.get("email") or "Signed in") + '</span>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("↪  Sign out", use_container_width=True, key="signout_nav"):
+            tokens = st.session_state.get("auth_tokens") or {}
+            try:
+                if tokens.get("access_token"):
+                    auth_request(
+                        "/logout", method="POST", body={},
+                        access_token=tokens["access_token"],
+                    )
+            except RuntimeError:
+                pass
+            clear_auth()
+            st.rerun()
+    return page
+
+
+def render_overview(user, active_connections, connection_errors):
+    page_header(
+        "Overview",
+        "One place to manage your data connections, AI analysis and upcoming automations.",
+        tag="WORKSPACE OVERVIEW",
+    )
+    first = (user.get("email") or "there").split("@")[0]
+    st.markdown(
+        '<div class="hero-card">'
+        '<div class="hero-kicker">YOUR DIGITAL ANALYST</div>'
+        f'<h2>Welcome back, {safe_html(first)}.</h2>'
+        '<p>Your AI Employee is ready to answer questions about connected business data. '
+        'More capabilities — scheduled tasks, deliveries, and tracked usage — '
+        'will appear here as we enable them.</p></div>',
+        unsafe_allow_html=True,
+    )
+    a, b, c, d = st.columns(4, gap="medium")
+    with a:
+        metric_card("Connected sources", len(active_connections), "Live Composio connections")
+    with b:
+        metric_card("Available integrations", len(APPS), "Ready for connection")
+    with c:
+        metric_card("Scheduled tasks", "—", "Not enabled yet")
+    with d:
+        metric_card("AI usage", "—", "Tracking coming next")
+
+    left, right = st.columns([1.55, 1], gap="large")
+    with left:
+        section("Your workspace", "What is available today")
+        with st.container(border=True):
+            st.markdown("**✧ AI Analyst**")
+            st.caption("Ask questions about the selected GA4 property or connected CRM data.")
+            st.markdown("**⛓ Connected data sources**")
+            if active_connections:
+                for name, config in APPS.items():
+                    if config["toolkit"] in active_connections:
+                        st.markdown(f"• {name}  ·  Connected")
+            else:
+                st.info("Connect Google Analytics or HubSpot to get started.")
+            st.markdown("**☑ Tasks & scheduled reports**")
+            st.caption("Interface prepared; task execution is not enabled yet.")
+    with right:
+        section("System status", "Live account-level status")
+        with st.container(border=True):
+            st.markdown("**Authentication**")
+            st.success("Supabase login active")
+            st.markdown("**AI model**")
+            st.caption(GEMINI_MODEL)
+            st.markdown("**Integrations**")
+            if connection_errors:
+                st.warning("Connection status couldn't be checked for every service.")
+            elif active_connections:
+                st.success(f"{len(active_connections)} connected source(s)")
+            else:
+                st.info("No sources connected yet")
+
+
+def render_live_integration(name, config, accounts, error):
+    toolkit = config["toolkit"]
+    with st.container(border=True):
+        description = {
+            "google_analytics": "Web analytics and user journeys",
+            "hubspot": "CRM contacts, companies and deals",
+        }.get(toolkit, "Business data connector")
+        integration_intro(name, LOGOS.get(name, toolkit), description, bool(accounts))
+        st.markdown('<div style="height:5px"></div>', unsafe_allow_html=True)
+        if error:
+            st.warning("Unable to check the connection.")
+        elif accounts:
+            if st.button(
+                "Manage connection", key=f"manage_{toolkit}", use_container_width=True
+            ):
+                st.session_state["manage_toolkit"] = (
+                    None if st.session_state.get("manage_toolkit") == toolkit else toolkit
+                )
+        else:
+            if st.button(
+                "Connect", key=f"connect_{toolkit}",
+                type="primary", use_container_width=True,
+            ):
+                try:
+                    link = create_connect_link(st.secrets[config["secret"]])
+                    st.session_state.setdefault("connect_links", {})[toolkit] = link
+                except (RuntimeError, KeyError) as err:
+                    st.error(str(err))
+            link = st.session_state.get("connect_links", {}).get(toolkit)
+            if link:
+                st.link_button(
+                    "Authorize account ↗", link, use_container_width=True
+                )
+                if st.button("Refresh status", key=f"refresh_{toolkit}", use_container_width=True):
+                    st.rerun()
+
+
+def render_connection_manager(toolkit, accounts, active_connections):
+    name = next(n for n,c in APPS.items() if c["toolkit"] == toolkit)
+    st.divider()
+    section(f"Manage {name}", "Choose the connected account and configure the available data.")
+    if not accounts:
+        st.info("This account is not connected yet.")
+        return
+    with st.container(border=True):
+        if len(accounts) > 1:
+            chosen_id = st.selectbox(
+                "Choose connected account", [a["id"] for a in accounts],
+                key="active_" + toolkit,
+            )
+            account = next(a for a in accounts if a["id"] == chosen_id)
+        else:
+            account = accounts[0]
+        active_connections[toolkit] = account
+        st.success(f"Connected · {len(accounts)} account(s)")
+        st.caption("Connection ID: " + safe_html(account["id"]))
+        if toolkit == "google_analytics":
+            previous = st.session_state.get("ga4_property_connection")
+            if previous and previous != account["id"]:
+                clear_ga4_state()
+            if st.button("Load GA4 properties", type="primary", key="load_ga4"):
+                try:
+                    with st.spinner("Loading GA4 properties..."):
+                        props = load_ga4_properties(account["id"])
+                    clear_ga4_state()
+                    st.session_state["ga4_properties"] = props
+                    st.session_state["ga4_property_connection"] = account["id"]
+                except (RuntimeError, KeyError) as err:
+                    st.error(str(err))
+            properties = st.session_state.get("ga4_properties", [])
+            if (properties and
+                st.session_state.get("ga4_property_connection") == account["id"]):
+                options = {
+                    p["id"]: f'{p["account"]} / {p["name"]} ({p["id"]})'
+                    for p in properties
+                }
+                st.caption(f"Found {len(options)} available GA4 properties")
+                # Saved options persist within this authenticated Streamlit session.
+                st.multiselect(
+                    "Properties to analyze", list(options),
+                    format_func=lambda x: options[x], key="ga4_selected",
+                )
+                if st.button("Save selection", key="save_ga4", type="primary"):
+                    selected = st.session_state.get("ga4_selected", [])
+                    if selected:
+                        st.session_state["approved_ga4_properties"] = list(selected)
+                        st.success(f"Saved {len(selected)} properties")
+                    else:
+                        st.warning("Choose at least one property")
+                approved = st.session_state.get("approved_ga4_properties", [])
+                if approved:
+                    st.info(f"{len(approved)} property/properties approved for AI Chat")
+        with st.expander("Disconnect account"):
+            confirmed = st.checkbox(
+                "I understand this will remove access to this connection",
+                key=f"confirm_{account['id']}",
+            )
+            if st.button(
+                "Disconnect", key=f"disconnect_{account['id']}",
+                disabled=not confirmed,
+            ):
+                try:
+                    disconnect_account(account["id"], toolkit)
+                    if toolkit == "google_analytics":
+                        clear_ga4_state()
+                    st.session_state["manage_toolkit"] = None
+                    st.session_state.get("connect_links", {}).pop(toolkit, None)
+                    st.success("Disconnected")
+                    st.rerun()
+                except RuntimeError as err:
+                    st.error(str(err))
+
+
+def render_integrations(accounts_by_toolkit, active_connections, errors):
+    page_header(
+        "Integrations",
+        "Connect the platforms your AI Employee can securely read and analyze.",
+        tag="DATA SOURCES",
+    )
+    count = sum(bool(a) for a in accounts_by_toolkit.values())
+    a, b, c = st.columns(3, gap="medium")
+    with a:
+        metric_card("Connected", count, "Connected data source types")
+    with b:
+        metric_card("Available now", len(APPS), "Ready to connect")
+    with c:
+        metric_card("On the roadmap", len(UPCOMING_APPS), "Not enabled yet")
+
+    section("Available integrations", "Live connections supported by the current prototype")
+    columns = st.columns(3, gap="medium")
+    for i, (name, config) in enumerate(APPS.items()):
+        with columns[i % 3]:
+            render_live_integration(
+                name, config,
+                accounts_by_toolkit.get(config["toolkit"], []),
+                errors.get(config["toolkit"]),
+            )
+    with columns[len(APPS) % 3]:
+        st.markdown(
+            '<div class="soon-card" style="min-height:230px;border-style:dashed;'
+            'background:#f3f5fc;display:flex;flex-direction:column;justify-content:center">'
+            '<div style="font-size:26px;color:#6765e6;margin-bottom:9px">＋</div>'
+            '<div class="integration-name">More integrations</div>'
+            '<div class="integration-desc" style="margin-top:10px">'
+            'New connectors will appear here after testing and approval.</div>'
+            '</div>', unsafe_allow_html=True,
+        )
+
+    manager = st.session_state.get("manage_toolkit")
+    if manager in accounts_by_toolkit:
+        render_connection_manager(
+            manager, accounts_by_toolkit[manager], active_connections,
+        )
+    section("Coming soon", "Reserved slots for future platforms — not yet connected")
+    cols = st.columns(3, gap="medium")
+    for i, (name, slug) in enumerate(UPCOMING_APPS):
+        with cols[i % 3]:
+            st.markdown(
+                '<div class="soon-card"><div class="soon-top">'
+                '<div class="soon-logo">'
+                f'<img src="{safe_html(logo_url(slug))}" alt="{safe_html(name)} logo">'
+                '</div>'
+                f'<div class="soon-name">{safe_html(name)}</div>'
+                '</div><span class="status-pill status-violet">Planned</span></div>',
+                unsafe_allow_html=True,
+            )
+
+
+def render_ai_chat(active_connections):
+    page_header(
+        "AI Chat", "Ask questions and get answers from your connected business data.",
+        tag="LIVE AI ASSISTANT",
+    )
+    approved = st.session_state.get("approved_ga4_properties", [])
+    active_property = None
+    if "google_analytics" in active_connections and approved:
+        active_property = st.selectbox(
+            "GA4 property for this conversation", approved,
+            key="active_ga4_property",
+        )
+    left, right = st.columns([2.35, 1], gap="large")
+    with left:
+        with st.container(border=True):
+            st.markdown("**✧ Your AI Analyst**")
+            st.caption("Connected-data answers, backed by approved read-only tools")
+            if not active_connections:
+                st.info("No data sources connected. Go to Integrations to connect GA4 or HubSpot.")
+            if "messages" not in st.session_state:
+                st.session_state.messages = []
+            if st.button("Clear conversation", key="clear_conversation"):
+                st.session_state.messages = []
+                st.rerun()
+            st.divider()
+            for msg in st.session_state.messages:
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
+            if prompt := st.chat_input("Ask your AI Employee..."):
+                conversation = st.session_state.messages + [{"role": "user", "content": prompt}]
+                with st.chat_message("user"):
+                    st.markdown(prompt)
+                with st.chat_message("assistant"):
+                    with st.spinner("Analyzing your request..."):
+                        try:
+                            answer, tools_used = ask_ai(
+                                conversation, active_connections, active_property,
+                            )
+                            st.markdown(answer)
+                            if tools_used:
+                                with st.expander("Tools used"):
+                                    for tool in tools_used:
+                                        st.code(tool)
+                            st.session_state.messages.extend([
+                                {"role": "user", "content": prompt},
+                                {"role": "assistant", "content": answer},
+                            ])
+                        except RuntimeError as err:
+                            st.error(str(err))
+    with right:
+        section("Context", "Data sources this session")
+        with st.container(border=True):
+            if not active_connections:
+                st.caption("No sources connected yet")
+            else:
+                for name, config in APPS.items():
+                    if config["toolkit"] in active_connections:
+                        st.markdown(f"**✓ {name}**")
+            if active_property:
+                st.caption("GA4 property: " + str(active_property))
+            elif "google_analytics" in active_connections:
+                st.warning("Select a GA4 property in Integrations first")
+            st.divider()
+            st.markdown("**AI Safety**")
+            st.caption("Read-only analysis. No write or delete tools enabled.")
+        section("Try asking")
+        st.markdown(
+            "- How many sessions did we get last week?\n"
+            "- Which channel drove the most traffic?\n"
+            "- Summarize our performance this month."
+        )
+
+
+def render_tasks():
+    page_header("My Tasks", "Plan, manage and monitor your AI Employee's work.", tag="IN DEVELOPMENT")
+    a, b, c = st.columns(3, gap="medium")
+    with a: metric_card("All tasks", "—", "Awaiting Supabase integration")
+    with b: metric_card("Scheduled", "—", "Scheduler not enabled")
+    with c: metric_card("Completed runs", "—", "No execution service yet")
+    section("Task workspace")
+    empty_feature(
+        "☑", "Your task manager is ready for the next development phase.",
+        "We'll connect the existing Supabase tasks and task_runs tables here, "
+        "then enable approvals, schedules and execution history. "
+        "This page does not create or run tasks yet.",
+    )
+
+
+def render_usage():
+    page_header("Usage & Credits", "Monitor API consumption and account-level costs.", tag="IN DEVELOPMENT")
+    a,b,c = st.columns(3,gap="medium")
+    with a: metric_card("AI token usage", "—", "Tracking not connected")
+    with b: metric_card("Estimated cost", "—", "No ledger written yet")
+    with c: metric_card("Credits remaining", "—", "Limits not configured")
+    section("Cost & credits")
+    empty_feature(
+        "◫", "Usage monitoring will appear here.",
+        "Next we'll record actual Gemini token usage and integration calls "
+        "per authenticated user, then add limits and cost reporting. "
+        "No cost values are being calculated by this screen today.",
+    )
+
+
+def render_settings(user):
+    page_header("Settings", "Manage your workspace preferences and account.", tag="PRIVATE BETA")
+    left,right = st.columns([1.4,1],gap="large")
+    with left:
+        section("Account details")
+        with st.container(border=True):
+            st.markdown("**Signed-in email**")
+            st.code(user.get("email") or "Unavailable")
+            st.markdown("**Authentication**")
+            st.caption("Supabase Auth — verified user session")
+            st.markdown("**Default timezone**")
+            st.caption("Africa/Cairo · Scheduled-task timezone will be configurable later")
+    with right:
+        section("AI configuration")
+        with st.container(border=True):
+            st.markdown("**Model**")
+            st.caption(GEMINI_MODEL)
+            st.markdown("**Tool permission**")
+            st.success("Read-only tools")
+            st.caption("Custom AI instructions and task-delivery preferences are planned.")
+
+
+# ==========================================
+# MAIN APPLICATION
+# ==========================================
+
+inject_theme()
 user = get_signed_in_user()
 if not user:
     render_login()
     st.stop()
 
-st.sidebar.markdown("### 🤖 AI Employee")
-st.sidebar.caption(user.get("email", "Signed in"))
-if st.sidebar.button("Sign Out", type="secondary"):
-    tokens = st.session_state.get("auth_tokens") or {}
-    try:
-        if tokens.get("access_token"):
-            auth_request(
-                "/logout", method="POST", body={},
-                access_token=tokens["access_token"],
-            )
-    except RuntimeError:
-        pass  # Always clear local session even if remote revoke fails.
-    clear_auth()
-    st.rerun()
-
-st.title("🤖 AI Employee")
-st.caption("Your AI-powered business data analyst")
-st.info("Private beta · Signed in as " + user.get("email", "user"))
-
 if "connect_links" not in st.session_state:
-    st.session_state.connect_links = {}
+    st.session_state["connect_links"] = {}
 
-tab_integrations, tab_chat = st.tabs([
-    "🔌 Integrations",
-    "💬 AI Chat",
-])
+active_connections, accounts_by_toolkit, connection_errors = load_connection_state()
+page = render_sidebar(user, active_connections)
 
-active_connections = {}
-
-
-# ==========================================
-# INTEGRATIONS PAGE
-# ==========================================
-
-with tab_integrations:
-    st.subheader("Connect your data sources")
-
-    for app_name, config in APPS.items():
-        toolkit = config["toolkit"]
-
-        with st.container(border=True):
-            st.subheader(app_name)
-
-            try:
-                accounts = get_connections(toolkit)
-            except (RuntimeError, KeyError) as error:
-                st.error(str(error))
-                continue
-
-            if accounts:
-                st.success(
-                    f"Connected — {len(accounts)} account(s)"
-                )
-
-                if len(accounts) > 1:
-                    labels = {
-                        a["id"]: a["id"]
-                        for a in accounts
-                    }
-
-                    chosen_id = st.selectbox(
-                        f"Choose {app_name} connection",
-                        list(labels.keys()),
-                        key=f"active_{toolkit}",
-                    )
-
-                    account = next(
-                        a for a in accounts
-                        if a["id"] == chosen_id
-                    )
-                else:
-                    account = accounts[0]
-
-                active_connections[toolkit] = account
-
-                with st.expander("Disconnect account"):
-                    confirmed = st.checkbox(
-                        "I confirm disconnection",
-                        key=f"confirm_{account['id']}",
-                    )
-
-                    if st.button(
-                        "Disconnect",
-                        key=f"disconnect_{account['id']}",
-                        disabled=not confirmed,
-                    ):
-                        try:
-                            disconnect_account(
-                                account["id"], toolkit
-                            )
-
-                            if toolkit == "google_analytics":
-                                clear_ga4_state()
-
-                            st.success("Disconnected.")
-                            st.rerun()
-
-                        except RuntimeError as error:
-                            st.error(str(error))
-
-                if toolkit == "google_analytics":
-                    previous_connection = (
-                        st.session_state.get(
-                            "ga4_property_connection"
-                        )
-                    )
-
-                    if (
-                        previous_connection
-                        and previous_connection != account["id"]
-                    ):
-                        clear_ga4_state()
-
-                    if st.button(
-                        "Load GA4 Properties",
-                        key="load_ga4",
-                    ):
-                        try:
-                            with st.spinner(
-                                "Loading GA4 properties..."
-                            ):
-                                props = load_ga4_properties(
-                                    account["id"]
-                                )
-
-                            clear_ga4_state()
-
-                            st.session_state[
-                                "ga4_properties"
-                            ] = props
-
-                            st.session_state[
-                                "ga4_property_connection"
-                            ] = account["id"]
-
-                        except (RuntimeError, KeyError) as error:
-                            st.error(str(error))
-
-            else:
-                st.info("Not connected")
-
-                if toolkit == "google_analytics":
-                    clear_ga4_state()
-
-                if st.button(
-                    f"Generate {app_name} Connect Link",
-                    key=f"connect_{toolkit}",
-                ):
-                    try:
-                        link = create_connect_link(
-                            st.secrets[config["secret"]]
-                        )
-
-                        st.session_state[
-                            "connect_links"
-                        ][toolkit] = link
-
-                    except (RuntimeError, KeyError) as error:
-                        st.error(str(error))
-
-                link = st.session_state[
-                    "connect_links"
-                ].get(toolkit)
-
-                if link:
-                    st.link_button(
-                        f"Authorize {app_name}",
-                        link,
-                        type="primary",
-                    )
-
-                    if st.button(
-                        "Refresh connection status",
-                        key=f"refresh_{toolkit}",
-                    ):
-                        st.rerun()
-
-    # GA4 property selection
-    if (
-        "google_analytics" in active_connections
-        and "ga4_properties" in st.session_state
-    ):
-        st.divider()
-        st.subheader("Select GA4 Properties")
-
-        properties = st.session_state[
-            "ga4_properties"
-        ]
-
-        options = {
-            item["id"]: (
-                f'{item["account"]} / '
-                f'{item["name"]} '
-                f'({item["id"]})'
-            )
-            for item in properties
-        }
-
-        st.success(
-            f"Found {len(properties)} GA4 properties"
-        )
-
-        selected = st.multiselect(
-            "Choose properties to analyze",
-            options=list(options.keys()),
-            format_func=lambda p: options[p],
-            key="ga4_selected",
-        )
-
-        if st.button("Save selection"):
-            if selected:
-                st.session_state[
-                    "approved_ga4_properties"
-                ] = list(selected)
-
-                st.success(
-                    f"Saved {len(selected)} properties."
-                )
-            else:
-                st.warning(
-                    "Select at least one property."
-                )
-
-
-# ==========================================
-# AI CHAT PAGE
-# ==========================================
-
-with tab_chat:
-    st.subheader("AI Chat")
-    st.caption(f"Powered by {GEMINI_MODEL}")
-
-    approved = st.session_state.get(
-        "approved_ga4_properties", []
-    )
-
-    active_property = None
-
-    if (
-        "google_analytics" in active_connections
-        and approved
-    ):
-        active_property = st.selectbox(
-            "GA4 property for this conversation",
-            options=approved,
-            key="active_ga4_property",
-        )
-
-    if "hubspot" in active_connections:
-        st.success("HubSpot tools available")
-
-    if active_property:
-        st.success(
-            f"GA4 connected — Property {active_property}"
-        )
-
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-
-    if st.button("Clear conversation"):
-        st.session_state.messages = []
-        st.rerun()
-
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-
-    if prompt := st.chat_input(
-        "Ask your AI Employee..."
-    ):
-        conversation = (
-            st.session_state.messages
-            + [{
-                "role": "user",
-                "content": prompt,
-            }]
-        )
-
-        with st.chat_message("user"):
-            st.markdown(prompt)
-
-        with st.chat_message("assistant"):
-            with st.spinner(
-                "Analyzing your request..."
-            ):
-                try:
-                    answer, tools_used = ask_ai(
-                        conversation,
-                        active_connections,
-                        active_property,
-                    )
-
-                    st.markdown(answer)
-
-                    if tools_used:
-                        with st.expander(
-                            "Tools used"
-                        ):
-                            for tool in tools_used:
-                                st.code(tool)
-
-                    st.session_state.messages.extend([
-                        {
-                            "role": "user",
-                            "content": prompt,
-                        },
-                        {
-                            "role": "assistant",
-                            "content": answer,
-                        },
-                    ])
-
-                except RuntimeError as error:
-                    st.error(str(error))
+if page == "Overview":
+    render_overview(user, active_connections, connection_errors)
+elif page == "AI Chat":
+    render_ai_chat(active_connections)
+elif page == "My Tasks":
+    render_tasks()
+elif page == "Integrations":
+    render_integrations(accounts_by_toolkit, active_connections, connection_errors)
+elif page == "Usage":
+    render_usage()
+elif page == "Settings":
+    render_settings(user)
