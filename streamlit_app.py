@@ -2296,9 +2296,9 @@ def render_overview(user, active_connections, connection_errors, rows,
 
 
 def navigate_to(page):
-    """Only real native Streamlit buttons may change this navigation state."""
+    """Stage navigation for the next rerun; don't mutate a rendered radio widget."""
     if page in ("Home", "Dashboard", "AI Chat", "My Tasks", "Integrations", "Usage", "Settings"):
-        st.session_state["nav_page"] = page
+        st.session_state["_pending_nav_page"] = page
 
 
 def render_oauth_popup_link(url, toolkit):
@@ -2890,7 +2890,12 @@ if "connect_links" not in st.session_state:
     st.session_state["connect_links"] = {}
 
 agent_prefs = initialize_agent_preferences()
-if "nav_page" not in st.session_state:
+# Apply button-initiated navigation BEFORE the sidebar radio widget is rendered.
+# Changing the radio's session_state key after creation raises StreamlitAPIException.
+pending_page = st.session_state.pop("_pending_nav_page", None)
+if pending_page in ("Home", "Dashboard", "AI Chat", "My Tasks", "Integrations", "Usage", "Settings"):
+    st.session_state["nav_page"] = pending_page
+elif "nav_page" not in st.session_state:
     st.session_state["nav_page"] = "Dashboard" if agent_prefs.get("onboarding_completed") else "Home"
 st.session_state["owner_is_admin"] = check_owner_admin()
 if st.session_state.get("nav_page")=="Owner Admin" and not st.session_state["owner_is_admin"]:
