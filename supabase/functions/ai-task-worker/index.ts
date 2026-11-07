@@ -473,7 +473,7 @@ function assertToolSucceeded(response:Json):void {
   for(let i=0;i<5;i++){
     if(typeof current!=="object"||current===null||Array.isArray(current))break;
     const item=asObject(current);
-    if(item.successful===false||item.ok===false||item.error)
+    if(item.successful===false||item.success===false||item.ok===false||item.error)
       throw new WorkerError("Delivery provider rejected the message.");
     const next=item.data??item.result??item.response;
     if(!next||typeof next!=="object"||Array.isArray(next))break;
@@ -506,9 +506,11 @@ async function sendApprovedReport(
       args.extra_recipients=recipients.slice(1);
     }
   }else{
-    if(!("channel" in fields)||!("text" in fields))
+    const channelField="channel" in fields?"channel":"channel_id" in fields?"channel_id":null;
+    const textField="text" in fields?"text":"message" in fields?"message":null;
+    if(!channelField||!textField)
       throw new WorkerError("Slack send action schema is not supported.");
-    args={channel:destination.channelId,text:"*"+subject+"*\n\n"+body};
+    args={[channelField]:destination.channelId,[textField]:"*"+subject+"*\n\n"+body};
   }
 
   const result=await composio(
