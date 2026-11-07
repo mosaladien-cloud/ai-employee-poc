@@ -59,13 +59,17 @@ APPS = {
         "toolkit": "slack",
         "secret": "SLACK_AUTH_CONFIG_ID",
     },
+    "Gmail": {
+        "toolkit": "gmail",
+        "secret": "GMAIL_AUTH_CONFIG_ID",
+    },
 }
 
-# Slack is a delivery destination, not a source of analytics data.
+# Slack and Gmail are delivery accounts, not analytics data sources.
 DATA_SOURCE_TOOLKITS = {"google_analytics", "hubspot"}
 
-# Explicit read-only tool allowlist. Slack is intentionally excluded so
-# AI Chat cannot send messages or execute any Slack write tools.
+# Explicit read-only tool allowlist. Gmail and Slack are intentionally excluded
+# so AI Chat cannot read emails or send messages.
 ALLOWED_TOOLS = {
     "google_analytics": [
         "GOOGLE_ANALYTICS_RUN_REPORT",
@@ -183,7 +187,7 @@ def clear_user_workspace():
         "approved_ga4_properties", "ga4_property_connection",
         "active_ga4_property", "messages", "authenticated_user",
         "verified_user_id", "active_google_analytics",
-        "active_hubspot", "active_slack", "load_ga4", "auth_notice",
+        "active_hubspot", "active_slack", "active_gmail", "load_ga4", "auth_notice",
         "nav_page", "manage_toolkit", "pending_connection_since",
         "credit_last_status", "agent_preferences", "saved_ga4_property_id",
         "saved_ga4_account_id", "agent_pref_error", "agent_task_draft", "owner_is_admin",
@@ -1996,7 +2000,7 @@ div[class*="st-key-integration_card_"] [data-testid="stVerticalBlockBorderWrappe
 
 # Catalog placeholders are VISUAL ONLY. They never create links or execute tools.
 # Only data-reading integrations are added to the AI Chat tool allowlist.
-# Delivery destinations (Slack) may connect through OAuth without AI Chat
+# Delivery destinations (Slack/Gmail) may connect through OAuth without AI Chat
 # permissions; planned cards are always visual-only.
 UPCOMING_APPS = [
     ("Google Ads", "googleads"),
@@ -2008,7 +2012,6 @@ UPCOMING_APPS = [
     ("Klaviyo", "klaviyo"),
     ("Salesforce", "salesforce"),
     ("WhatsApp", "whatsapp"),
-    ("Gmail", "gmail"),
     ("Google Sheets", "googlesheets"),
     ("TikTok", "tiktok"),
     ("Mailchimp", "mailchimp"),
@@ -2020,6 +2023,7 @@ LOGOS = {
     "Google Analytics": "googleanalytics",
     "HubSpot": "hubspot",
     "Slack": "slack",
+    "Gmail": "gmail",
 }
 
 
@@ -2272,7 +2276,8 @@ def render_home(user, connections, tasks, task_error):
     st.markdown("**1. Connect an analytics account**  " + ("✓ Connected" if has_data_source else "· Not connected"))
     st.markdown("**2. Choose a default analytics property**  " + ("✓ Saved" if source_ready else "· Choose it in Integrations"))
     st.markdown("**3. Create your first report**  " + ("✓ Task saved" if first_task else "· Create one in My Tasks"))
-    st.markdown("**4. Connect Slack for report delivery (optional)**  " + ("✓ Connected" if "slack" in connections else "· Connect in Integrations"))
+    delivery_ready = any(service in connections for service in ("slack", "gmail"))
+    st.markdown("**4. Connect a delivery account (optional)**  " + ("✓ Connected" if delivery_ready else "· Connect Slack or Gmail in Integrations"))
     st.caption("Reports use your chosen data source. Your scheduled reports will only run when their schedule is active.")
     if st.button("Open my dashboard",type="primary",key="home_dashboard"):
         try:
@@ -2481,6 +2486,7 @@ def render_live_integration(name, config, accounts, error, active_connections):
             "google_analytics": "Web analytics and user journeys",
             "hubspot": "CRM contacts, companies and deals",
             "slack": "Team channels and report delivery",
+            "gmail": "Email account for report delivery",
         }.get(toolkit, "Business data connector")
         integration_intro(name, LOGOS.get(name, toolkit), desc, bool(accounts))
         st.markdown('<div style="height:5px"></div>', unsafe_allow_html=True)
@@ -2824,7 +2830,7 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                 else:
                     st.caption("No report result is available yet.")
     with right:
-        section("Report delivery", "Choose a Slack channel for new reports")
+        section("Report delivery", "Connect your accounts and choose a destination")
         selected_slack_target = None
         with st.container(border=True):
             slack_account = active_connections.get("slack")
@@ -2865,7 +2871,20 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
             if st.button(button_text, key="tasks_slack_integration", use_container_width=True):
                 navigate_to("Integrations")
                 st.rerun()
-            st.caption("Email and WhatsApp delivery are coming soon.")
+            st.caption("Automatic Slack sending is coming soon.")
+        with st.container(border=True):
+            if active_connections.get("gmail"):
+                st.success("Gmail account connected")
+                st.caption("Reports will be able to send from your linked Gmail account after email delivery is enabled.")
+                gmail_button = "Manage Gmail connection"
+            else:
+                st.info("Gmail is not connected")
+                st.caption("Link your Gmail account in Integrations to prepare for email delivery.")
+                gmail_button = "Connect Gmail"
+            if st.button(gmail_button, key="tasks_gmail_integration", use_container_width=True):
+                navigate_to("Integrations")
+                st.rerun()
+            st.caption("Gmail sending and WhatsApp delivery are not active yet.")
         section("Create a report","Describe it in your own words or fill in the details")
         with st.container(border=True):
             description=st.text_area("What would you like your AI Employee to do?",
@@ -3016,7 +3035,7 @@ def render_settings(user):
             st.markdown("**AI Employee**")
             st.success("Ready for data analysis")
             st.markdown("**Source permissions**")
-            st.caption("AI Chat has read-only access to connected data. Slack is separate and cannot be used by AI Chat to send messages.")
+            st.caption("AI Chat has read-only access to supported analytics sources. Slack and Gmail are separate and cannot be used by AI Chat to send messages.")
             st.caption("Custom AI instructions and task-delivery preferences are planned.")
 
 
