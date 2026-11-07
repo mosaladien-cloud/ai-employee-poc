@@ -55,9 +55,17 @@ APPS = {
         "toolkit": "hubspot",
         "secret": "HUBSPOT_AUTH_CONFIG_ID",
     },
+    "Slack": {
+        "toolkit": "slack",
+        "secret": "SLACK_AUTH_CONFIG_ID",
+    },
 }
 
-# Explicit read-only tool allowlist.
+# Slack is a delivery destination, not a source of analytics data.
+DATA_SOURCE_TOOLKITS = {"google_analytics", "hubspot"}
+
+# Explicit read-only tool allowlist. Slack is intentionally excluded so
+# AI Chat cannot send messages or execute any Slack write tools.
 ALLOWED_TOOLS = {
     "google_analytics": [
         "GOOGLE_ANALYTICS_RUN_REPORT",
@@ -175,7 +183,7 @@ def clear_user_workspace():
         "approved_ga4_properties", "ga4_property_connection",
         "active_ga4_property", "messages", "authenticated_user",
         "verified_user_id", "active_google_analytics",
-        "active_hubspot", "load_ga4", "auth_notice",
+        "active_hubspot", "active_slack", "load_ga4", "auth_notice",
         "nav_page", "manage_toolkit", "pending_connection_since",
         "credit_last_status", "agent_preferences", "saved_ga4_property_id",
         "saved_ga4_account_id", "agent_pref_error", "agent_task_draft", "owner_is_admin",
@@ -1908,8 +1916,9 @@ p {color:#53637a;}
 
 
 # Catalog placeholders are VISUAL ONLY. They never create links or execute tools.
-# Add a real integration to APPS and ALLOWED_TOOLS only after configuring,
-# testing and approving it in Composio. Do not treat these as active connectors.
+# Only data-reading integrations are added to the AI Chat tool allowlist.
+# Delivery destinations (Slack) may connect through OAuth without AI Chat
+# permissions; planned cards are always visual-only.
 UPCOMING_APPS = [
     ("Google Ads", "googleads"),
     ("Meta Ads", "meta"),
@@ -1919,7 +1928,7 @@ UPCOMING_APPS = [
     ("Shopify", "shopify"),
     ("Klaviyo", "klaviyo"),
     ("Salesforce", "salesforce"),
-    ("Slack", "slack"),
+    ("WhatsApp", "whatsapp"),
     ("Gmail", "gmail"),
     ("Google Sheets", "googlesheets"),
     ("TikTok", "tiktok"),
@@ -1931,6 +1940,7 @@ UPCOMING_APPS = [
 LOGOS = {
     "Google Analytics": "googleanalytics",
     "HubSpot": "hubspot",
+    "Slack": "slack",
 }
 
 
@@ -2179,9 +2189,11 @@ def render_home(user, connections, tasks, task_error):
     st.markdown("### Get started")
     source_ready = bool(st.session_state.get("saved_ga4_account_id") and st.session_state.get("saved_ga4_property_id"))
     first_task = bool(tasks) if not task_error else False
-    st.markdown("**1. Connect an analytics account**  " + ("✓ Connected" if connections else "· Not connected"))
+    has_data_source = any(name in connections for name in DATA_SOURCE_TOOLKITS)
+    st.markdown("**1. Connect an analytics account**  " + ("✓ Connected" if has_data_source else "· Not connected"))
     st.markdown("**2. Choose a default analytics property**  " + ("✓ Saved" if source_ready else "· Choose it in Integrations"))
     st.markdown("**3. Create your first report**  " + ("✓ Task saved" if first_task else "· Create one in My Tasks"))
+    st.markdown("**4. Connect Slack for report delivery (optional)**  " + ("✓ Connected" if "slack" in connections else "· Connect in Integrations"))
     st.caption("Reports use your chosen data source. Your scheduled reports will only run when their schedule is active.")
     if st.button("Open my dashboard",type="primary",key="home_dashboard"):
         try:
@@ -2216,7 +2228,7 @@ def render_overview(user, active_connections, connection_errors, rows,
         'is being used—all in one place.</p></div>', unsafe_allow_html=True,
     )
     k1, k2, k3, k4 = st.columns(4, gap="medium")
-    with k1: metric_card("Connected sources", len(active_connections), "Linked to this workspace")
+    with k1: metric_card("Connected sources", sum(t in active_connections for t in DATA_SOURCE_TOOLKITS), "Linked to this workspace")
     with k2: metric_card("Planned tasks", "—" if tasks_error else str(len(planned)), "Saved task plans")
     with k3: metric_card("Completed runs", "—" if tasks_error else str(completed_runs), "This month")
     with k4: metric_card("AI activities", "—" if usage_error else str(monthly["requests"]), "This month")
@@ -2264,7 +2276,9 @@ def render_overview(user, active_connections, connection_errors, rows,
                         f'<small>{safe_html(display_estimated_run_cost(task.get("id"), estimates))}</small>'
                         '</div></div>', unsafe_allow_html=True,
                     )
-                st.caption("Reports run when requested or when an active schedule is enabled. Delivery integrations are not active yet.")
+                st.caption("Reports run when requested or when an active schedule is enabled. Automatic delivery is not active yet.")
+                if "slack" in active_connections:
+                    st.caption("Slack connected as a future report destination.")
     with right:
         with st.container(border=True):
             st.markdown("**Recent activity**")
@@ -2387,8 +2401,11 @@ def render_live_integration(name, config, accounts, error, active_connections):
         desc = {
             "google_analytics": "Web analytics and user journeys",
             "hubspot": "CRM contacts, companies and deals",
+            "slack": "Connect your workspace for upcoming report delivery",
         }.get(toolkit, "Business data connector")
         integration_intro(name, LOGOS.get(name, toolkit), desc, bool(accounts))
+        if toolkit == "slack":
+            st.caption("OAuth connection is available. Automatic report delivery is not active yet.")
         st.markdown('<div style="height:5px"></div>', unsafe_allow_html=True)
         if error:
             st.warning("Unable to check connection.")
@@ -2506,37 +2523,50 @@ def render_connection_manager(toolkit, accounts, active_connections):
 def render_integrations(accounts_by_toolkit, active_connections, errors):
     page_header(
         "Integrations",
-        "Connect the platforms your AI Employee can securely read and analyze.",
-        tag="DATA SOURCES",
+        "Connect your data sources and report delivery accounts.",
+        tag="CONNECTED ACCOUNTS",
     )
-    count = sum(bool(a) for a in accounts_by_toolkit.values())
+    connected_count = sum(bool(a) for a in accounts_by_toolkit.values())
     a, b, c = st.columns(3, gap="medium")
     with a:
-        metric_card("Connected", count, "Connected data source types")
+        metric_card("Connected", connected_count, "Data and delivery integrations")
     with b:
-        metric_card("Available now", len(APPS), "Ready to connect")
+        metric_card("Available now", len(APPS), "Accounts you can connect")
     with c:
         metric_card("On the roadmap", len(UPCOMING_APPS), "Not enabled yet")
 
-    section("Available integrations", "Live connections supported by the current prototype")
+    section("Data sources", "Connect business platforms your AI Employee can read and analyze")
+    data_apps = [(name, cfg) for name, cfg in APPS.items()
+                 if cfg["toolkit"] in DATA_SOURCE_TOOLKITS]
     columns = st.columns(3, gap="medium")
-    for i, (name, config) in enumerate(APPS.items()):
+    for i, (name, config) in enumerate(data_apps):
         with columns[i % 3]:
             render_live_integration(
                 name, config,
                 accounts_by_toolkit.get(config["toolkit"], []),
                 errors.get(config["toolkit"]), active_connections,
             )
-    with columns[len(APPS) % 3]:
+    with columns[len(data_apps) % 3]:
         st.markdown(
             '<div class="soon-card" style="min-height:230px;border-style:dashed;'
             'background:#f3f5fc;display:flex;flex-direction:column;justify-content:center">'
             '<div style="font-size:26px;color:#6765e6;margin-bottom:9px">＋</div>'
             '<div class="integration-name">More integrations</div>'
             '<div class="integration-desc" style="margin-top:10px">'
-            'New connectors will appear here after testing and approval.</div>'
+            'New data sources will appear here after testing and approval.</div>'
             '</div>', unsafe_allow_html=True,
         )
+
+    section("Report delivery", "Connect Slack now; channel selection and sending will be enabled after testing")
+    delivery_columns = st.columns(3, gap="medium")
+    with delivery_columns[0]:
+        slack_config = APPS["Slack"]
+        render_live_integration(
+            "Slack", slack_config,
+            accounts_by_toolkit.get("slack", []),
+            errors.get("slack"), active_connections,
+        )
+    st.caption("A connected Slack workspace is not yet an active delivery route. Reports are currently saved in My Tasks.")
 
     section("Coming soon", "Reserved slots for future platforms — not yet connected")
     cols = st.columns(3, gap="medium")
@@ -2574,7 +2604,7 @@ def render_ai_chat(active_connections):
         with st.container(border=True):
             st.markdown("**✧ Your AI Employee**")
             st.caption("Ask a question, and get a clear answer from your connected business data.")
-            if not active_connections:
+            if not any(name in active_connections for name in DATA_SOURCE_TOOLKITS):
                 st.info("To get started, connect a data source in Integrations.")
             if "messages" not in st.session_state:
                 st.session_state.messages = []
@@ -2627,7 +2657,9 @@ def render_ai_chat(active_connections):
         section("Your workspace")
         with st.container(border=True):
             st.markdown("**Connected sources**")
-            sources = [name for name, config in APPS.items() if config["toolkit"] in active_connections]
+            sources = [name for name, config in APPS.items()
+                       if config["toolkit"] in DATA_SOURCE_TOOLKITS
+                       and config["toolkit"] in active_connections]
             if sources:
                 for name in sources:
                     st.markdown(f"✓ {safe_html(name)}")
@@ -2643,8 +2675,10 @@ def render_ai_chat(active_connections):
         )
 
 
-def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=None):
+def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=None,
+                 active_connections=None):
     task_rows,task_runs,usage_rows=task_rows or [],task_runs or [],usage_rows or []
+    active_connections = active_connections or {}
     page_header("My Tasks","Create, run and review your AI Employee's reports.",tag="YOUR REPORTS")
     # Show a one-time completion notice after a fresh rerun reloads task_runs.
     if st.session_state.pop("_task_run_just_completed", False):
@@ -2736,6 +2770,20 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                 else:
                     st.caption("No report result is available yet.")
     with right:
+        section("Report delivery", "Where completed reports will be sent")
+        with st.container(border=True):
+            if "slack" in active_connections:
+                st.success("Slack workspace connected")
+                st.caption("Your workspace is linked. Choosing a channel and sending reports are not active yet.")
+                button_text = "Manage Slack connection"
+            else:
+                st.info("Slack is not connected")
+                st.caption("Link your Slack workspace from Integrations. You will be able to choose a channel once sending is enabled.")
+                button_text = "Connect Slack"
+            if st.button(button_text, key="tasks_slack_integration", use_container_width=True):
+                navigate_to("Integrations")
+                st.rerun()
+            st.caption("Email and WhatsApp delivery are coming soon.")
         section("Create a report","Describe it in your own words or fill in the details")
         with st.container(border=True):
             description=st.text_area("What would you like your AI Employee to do?",
@@ -2778,7 +2826,7 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                 with time_col:
                     planned_time=st.time_input("Time (Cairo)",value=datetime.now(CAIRO).replace(hour=9,minute=0,second=0,microsecond=0).time())
                 delivery=st.selectbox("Delivery",["none","email","slack"],
-                    format_func=lambda x:{"none":"Save in workspace","email":"Email (coming later)","slack":"Slack (coming later)"}[x])
+                    format_func=lambda x:{"none":"Save in workspace","email":"Email (coming later)","slack":"Slack (delivery coming later)"}[x])
                 destination=st.text_input("Destination (optional)")
                 submit=st.form_submit_button("Save task plan",type="primary",use_container_width=True)
             if submit:
@@ -2787,7 +2835,7 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                     st.rerun()
                 except ValueError as error:st.warning(str(error))
                 except RuntimeError:st.error("Couldn't save your task right now.")
-            st.caption("Tasks are saved as drafts until you activate them. Email and Slack delivery are not yet available.")
+            st.caption("Tasks are saved as drafts until activated. Selecting Slack here only saves a plan; no message is sent yet.")
 
 
 def render_usage(rows, usage_error=None, credit_status=None, credit_error=None):
@@ -2876,7 +2924,7 @@ def render_settings(user):
             st.markdown("**AI Employee**")
             st.success("Ready for data analysis")
             st.markdown("**Source permissions**")
-            st.caption("Read-only access to connected data")
+            st.caption("AI Chat has read-only access to connected data. Slack is separate and cannot be used by AI Chat to send messages.")
             st.caption("Custom AI instructions and task-delivery preferences are planned.")
 
 
@@ -2944,7 +2992,7 @@ elif page == "Dashboard":
 elif page == "AI Chat":
     render_ai_chat(active_connections)
 elif page == "My Tasks":
-    render_tasks(task_rows, task_runs, usage_rows, tasks_error)
+    render_tasks(task_rows, task_runs, usage_rows, tasks_error, active_connections)
 elif page == "Integrations":
     render_integrations(accounts_by_toolkit, active_connections, connection_errors)
 elif page == "Usage":
