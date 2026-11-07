@@ -1,10 +1,10 @@
-// AI Employee V7.4.2 - Safe delivery: no retroactive or automatic backlog sending
+// AI Employee V7.4.3 - Date validation type safety + verified delivery responses
 // One run per invocation; no schedules are created by this file.
 // Auth: Supabase secret key on apikey (verify_jwt disabled for this function).
 // Uses the existing V6 credit reservation, metering and settlement functions.
 import { withSupabase } from "npm:@supabase/server@1";
 
-const WORKER_VERSION = "7.4.2";
+const WORKER_VERSION = "7.4.3";
 const MODEL = "gemini-3.5-flash-lite";
 const MODEL_PRICING = "gemini-3.5-flash-lite-standard-2026-11-07";
 const COMPOSIO_BASE = "https://backend.composio.dev/api/v3.1";
@@ -336,7 +336,7 @@ function resolveReportPeriod(instructions:string):ReportPeriod|undefined {
 function normalizeGa4Date(value:unknown):string|undefined {
   if(typeof value!=="string")return undefined;
   const date=value.trim();
-  if(isValidIsoDate(date))return date;
+  if(/^\d{4}-\d{2}-\d{2}$/.test(date))return isValidIsoDate(date)?date:undefined;
   if(/^today$/i.test(date))return "today";
   if(/^yesterday$/i.test(date))return "yesterday";
   const rel=date.match(/^(\d{1,8})daysAgo$/i);
@@ -406,7 +406,7 @@ async function executeReadTool(
     tool_slug:slug,
     arguments:args,
   });
-  if(result.error || (result.result_type && result.result_type!=="completed")){
+  if(result.result_type!=="completed" || result.error){
     throw new WorkerError("Connected GA4 service could not complete the requested report.",true);
   }
   const payload=result.data??result;
@@ -632,8 +632,8 @@ function parseDelivery(type:string, raw:unknown):Json {
 }
 
 function assertToolSucceeded(response:Json):void {
-  if(response.error || (response.result_type && response.result_type!=="completed"))
-    throw new WorkerError("Delivery provider could not complete the message request.");
+  if(response.result_type!=="completed" || response.error)
+    throw new WorkerError("Delivery provider could not confirm the message request.");
   let current:unknown=response.data??response;
   for(let i=0;i<5;i++){
     if(typeof current!=="object"||current===null||Array.isArray(current))break;
@@ -769,7 +769,15 @@ async function processOne(db:Db, specificRunId?:string):Promise<Response> {
     try{deliveryStatus=await deliverCompletedRun(db,runId);}
     catch(error){
       console.warn("Completed report delivery could not be processed",safeError(error));
-      deliveryStatus="pending";
+      // If delivery never got claimed, allow an explicit, free delivery-only
+      // retry instead of leaving the report misleadingly 'not_requested'.
+      // Never modify 'sending': the provider might have accepted that message.
+      const {data:marked,error:markError}=await db.from("task_runs")
+        .update({delivery_status:"failed"})
+        .eq("id",runId).eq("status","success")
+        .eq("delivery_status","not_requested")
+        .select("id").maybeSingle();
+      deliveryStatus=!markError&&marked?"failed":"pending";
     }
     return Response.json({status:"success",version:WORKER_VERSION,run_id:runId,estimated_cost_usd:outcome.estimatedCost,
       delivery_status:deliveryStatus});
