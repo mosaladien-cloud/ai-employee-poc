@@ -833,6 +833,31 @@ def run_saved_task(task):
     return invoke_task_worker(result)
 
 
+def retry_saved_report_delivery(run):
+    """Retry a failed delivery without regenerating or recharging a report."""
+    owner = usage_identity()
+    if not run or run.get("status") != "success" or run.get("delivery_status") != "failed":
+        raise RuntimeError("Only failed report deliveries can be retried.")
+    run_id = str(uuid.UUID(str(run["id"])))
+    owned = tasks_db_request("task_runs", query={
+        "select": "id",
+        "id": "eq." + run_id,
+        "user_id": "eq." + owner,
+        "status": "eq.success",
+        "delivery_status": "eq.failed",
+        "limit": "1",
+    })
+    if not isinstance(owned, list) or len(owned) != 1:
+        raise RuntimeError("This report delivery is no longer available for retry.")
+    return http_json(
+        SUPABASE_URL + "/functions/v1/ai-task-worker",
+        method="POST",
+        body={"action": "retry_delivery", "run_id": run_id},
+        headers={"apikey": SUPABASE_SECRET_KEY, "Content-Type": "application/json"},
+        timeout=105,
+    )
+
+
 def scheduler_is_ready():
     if not SUPABASE_SECRET_KEY.startswith("sb_secret_"):
         return False
@@ -925,7 +950,7 @@ def fetch_task_rows():
 def fetch_task_runs():
     owner = usage_identity()
     runs = tasks_db_request("task_runs", query={
-        "select": "id,task_id,status,created_at,started_at,finished_at,result,error_message,estimated_cost_usd,trigger_type,attempt_count,delivery_status,scheduled_for",
+        "select": "id,task_id,status,created_at,started_at,finished_at,result,error_message,estimated_cost_usd,trigger_type,attempt_count,delivery_status,delivered_at,scheduled_for",
         "user_id": "eq." + owner,
         "order": "created_at.desc",
         "limit": "400",
@@ -2881,6 +2906,32 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                     st.warning("This report couldn't be completed. Review the source connection and retry if needed.")
                 else:
                     st.caption("No report result is available yet.")
+                report_task=next((t for t in task_rows if t.get("id")==run.get("task_id")),None)
+                if state=="success" and report_task and report_task.get("delivery_type") in ("email","slack"):
+                    destination="Gmail" if report_task.get("delivery_type")=="email" else "Slack"
+                    delivery=run.get("delivery_status") or "not_requested"
+                    if delivery=="sent":
+                        st.success(f"Delivered to {destination}")
+                        if run.get("delivered_at"):
+                            st.caption("Delivered: " + str(run["delivered_at"])[:19])
+                    elif delivery=="failed":
+                        st.warning(f"Report saved, but sending to {destination} failed.")
+                        if st.button("Retry delivery only (no AI cost)",key="retry_delivery_"+str(run["id"])):
+                            try:
+                                outcome=retry_saved_report_delivery(run)
+                                if outcome.get("status")=="sent":
+                                    st.rerun()
+                                else:
+                                    st.warning("Delivery could not be confirmed. Check the destination.")
+                            except (RuntimeError, ValueError) as error:
+                                LOGGER.warning("Report delivery retry failed: %s",str(error)[:220])
+                                st.warning("Delivery retry failed. Check the connected account.")
+                    elif delivery=="unknown":
+                        st.warning("Sending may have completed, but confirmation was lost. Check the destination before retrying.")
+                    elif delivery=="sending":
+                        st.info("Report delivery is in progress.")
+                    else:
+                        st.caption("Report saved. Delivery has not been attempted yet.")
     with right:
         section("Report delivery", "Connect your accounts and choose a destination")
         selected_slack_target = None
