@@ -1444,7 +1444,7 @@ def validate_gmail_recipients(recipients):
             raise ValueError("Enter valid email addresses.")
         address = value.strip().lower()
         if len(address) > 254 or not re.fullmatch(
-            r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+",
+            r"[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+",
             address
         ):
             raise ValueError(f"Invalid recipient email: {value[:60]}")
