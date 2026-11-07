@@ -4,6 +4,7 @@
 // Uses the existing V6 credit reservation, metering and settlement functions.
 import { withSupabase } from "npm:@supabase/server@1";
 
+const WORKER_VERSION = "7.4.0";
 const MODEL = "gemini-3.5-flash-lite";
 const MODEL_PRICING = "gemini-3.5-flash-lite-standard-2026-11-07";
 const COMPOSIO_BASE = "https://backend.composio.dev/api/v3.1";
@@ -736,7 +737,7 @@ async function processOne(db:Db, specificRunId?:string):Promise<Response> {
       console.warn("Completed report delivery could not be processed",safeError(error));
       deliveryStatus="pending";
     }
-    return Response.json({status:"success",run_id:runId,estimated_cost_usd:outcome.estimatedCost,
+    return Response.json({status:"success",version:WORKER_VERSION,run_id:runId,estimated_cost_usd:outcome.estimatedCost,
       delivery_status:deliveryStatus});
   } catch(error){
     const retryable=error instanceof WorkerError && error.retryable;
@@ -749,7 +750,7 @@ async function processOne(db:Db, specificRunId?:string):Promise<Response> {
         p_error:safeMessage,p_retryable:retryable,
       }));
     } catch { state="recording_failed"; }
-    return Response.json({status:state,run_id:runId,message:safeMessage},
+    return Response.json({status:state,version:WORKER_VERSION,run_id:runId,message:safeMessage},
       {status:retryable?503:422});
   }
 }
@@ -767,7 +768,7 @@ export default {
           {"x-goog-api-key":mustEnvironment("GOOGLE_API_KEY")}),
         probe(COMPOSIO_BASE+"/connected_accounts?limit=1",composioHeaders()),
       ]);
-      return Response.json({worker:"ai-task-worker",status:gemini.connected&&composioCheck.connected?"connectivity_ready":"connection_failed",
+      return Response.json({worker:"ai-task-worker",version:WORKER_VERSION,status:gemini.connected&&composioCheck.connected?"connectivity_ready":"connection_failed",
         gemini,composio:composioCheck,task_execution_enabled:true,scheduling_enabled:false});
     }
     if(action==="preflight"){
@@ -783,7 +784,7 @@ export default {
         return Response.json({status:"database_unavailable"},{status:503});
       }
       const scheduleCheck=await db.rpc("v7_scheduler_ready",{});
-      return Response.json({status:"preflight_ready",saved_tasks:tasks.count??0,
+      return Response.json({status:"preflight_ready",version:WORKER_VERSION,saved_tasks:tasks.count??0,
         configured_ga4_workspaces:prefs.count??0,queued_runs:runs.count??0,
         scheduling_enabled:scheduleCheck.error?false:scheduleCheck.data===true,
         note:"No tasks executed by preflight."});
