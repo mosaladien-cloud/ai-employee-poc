@@ -2401,7 +2401,7 @@ def render_live_integration(name, config, accounts, error, active_connections):
         desc = {
             "google_analytics": "Web analytics and user journeys",
             "hubspot": "CRM contacts, companies and deals",
-            "slack": "Connect your workspace for upcoming report delivery",
+            "slack": "Connect your workspace for reporting and collaboration",
         }.get(toolkit, "Business data connector")
         integration_intro(name, LOGOS.get(name, toolkit), desc, bool(accounts))
         if toolkit == "slack":
@@ -2523,50 +2523,27 @@ def render_connection_manager(toolkit, accounts, active_connections):
 def render_integrations(accounts_by_toolkit, active_connections, errors):
     page_header(
         "Integrations",
-        "Connect your data sources and report delivery accounts.",
+        "Connect the platforms your AI Employee can work with.",
         tag="CONNECTED ACCOUNTS",
     )
     connected_count = sum(bool(a) for a in accounts_by_toolkit.values())
     a, b, c = st.columns(3, gap="medium")
     with a:
-        metric_card("Connected", connected_count, "Data and delivery integrations")
+        metric_card("Connected", connected_count, "Connected integrations")
     with b:
         metric_card("Available now", len(APPS), "Accounts you can connect")
     with c:
         metric_card("On the roadmap", len(UPCOMING_APPS), "Not enabled yet")
 
-    section("Data sources", "Connect business platforms your AI Employee can read and analyze")
-    data_apps = [(name, cfg) for name, cfg in APPS.items()
-                 if cfg["toolkit"] in DATA_SOURCE_TOOLKITS]
+    section("Available integrations", "Connect analytics sources and collaboration tools")
     columns = st.columns(3, gap="medium")
-    for i, (name, config) in enumerate(data_apps):
+    for i, (name, config) in enumerate(APPS.items()):
         with columns[i % 3]:
             render_live_integration(
                 name, config,
                 accounts_by_toolkit.get(config["toolkit"], []),
                 errors.get(config["toolkit"]), active_connections,
             )
-    with columns[len(data_apps) % 3]:
-        st.markdown(
-            '<div class="soon-card" style="min-height:230px;border-style:dashed;'
-            'background:#f3f5fc;display:flex;flex-direction:column;justify-content:center">'
-            '<div style="font-size:26px;color:#6765e6;margin-bottom:9px">＋</div>'
-            '<div class="integration-name">More integrations</div>'
-            '<div class="integration-desc" style="margin-top:10px">'
-            'New data sources will appear here after testing and approval.</div>'
-            '</div>', unsafe_allow_html=True,
-        )
-
-    section("Report delivery", "Connect Slack now; channel selection and sending will be enabled after testing")
-    delivery_columns = st.columns(3, gap="medium")
-    with delivery_columns[0]:
-        slack_config = APPS["Slack"]
-        render_live_integration(
-            "Slack", slack_config,
-            accounts_by_toolkit.get("slack", []),
-            errors.get("slack"), active_connections,
-        )
-    st.caption("A connected Slack workspace is not yet an active delivery route. Reports are currently saved in My Tasks.")
 
     section("Coming soon", "Reserved slots for future platforms — not yet connected")
     cols = st.columns(3, gap="medium")
