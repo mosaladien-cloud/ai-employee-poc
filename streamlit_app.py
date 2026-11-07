@@ -1,4 +1,4 @@
-# RELEASE_BUILD: AI_EMPLOYEE_UI_V4_1_USAGE_RESILIENCE_2026_11_07
+# RELEASE_BUILD: AI_EMPLOYEE_V5_CLIENT_WORKSPACE_2026_11_07
 # Gemini usage ledger, business overview, client usage charts, inline integration management.
 import json
 import logging
@@ -499,7 +499,7 @@ def fetch_usage_rows(lookback_days=93):
     records = []
     for offset in range(0, 10000, 500):
         query = {
-            "select": "id,request_id,model,input_tokens,output_tokens,thinking_tokens,cached_input_tokens,total_tokens,tool_calls,estimated_cost_usd,cost_status,created_at",
+            "select": "id,request_id,task_run_id,usage_type,model,input_tokens,output_tokens,thinking_tokens,cached_input_tokens,total_tokens,tool_calls,estimated_cost_usd,cost_status,created_at",
             "user_id": "eq." + user_id,
             "created_at": "gte." + since,
             "order": "created_at.desc",
@@ -565,7 +565,14 @@ def format_tokens(value):
 
 
 def format_cost(value):
-    return f"${amount(value):,.4f}"
+    value = amount(value)
+    if value == 0:
+        return "$0.00"
+    if abs(value) < Decimal("0.01"):
+        return f"${value:,.6f}"
+    if abs(value) < Decimal("1"):
+        return f"${value:,.4f}"
+    return f"${value:,.2f}"
 
 
 def usage_donut(summary):
@@ -605,6 +612,188 @@ def usage_daily_chart(summary, days=30):
     st.bar_chart({"Day": [d.strftime("%b %d") for d in daily],
                   "Tokens": list(daily.values())}, x="Day", y="Tokens", height=225)
 
+
+# ==========================================
+# TASK PLANNING (AUTHENTICATED USER + RLS)
+# ==========================================
+# Only saved plans are supported here. No scheduler or delivery worker exists yet.
+# SQL setup file must be applied before creating tasks.
+
+def tasks_db_request(table, method="GET", body=None, query=None):
+    if table not in ("tasks", "task_runs"):
+        raise RuntimeError("Unknown workspace resource.")
+    owner = usage_identity()
+    tokens = st.session_state.get("auth_tokens") or {}
+    token = tokens.get("access_token")
+    if not token:
+        raise RuntimeError("Sign in to manage your tasks.")
+    url = SUPABASE_URL + "/rest/v1/" + table
+    if query:
+        url += "?" + urlencode(query)
+    headers = {
+        "apikey": SUPABASE_PUBLISHABLE_KEY,
+        "Authorization": "Bearer " + token,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Prefer": "return=minimal",
+    }
+    return http_json(url, method=method, body=body, headers=headers, timeout=30)
+
+
+def fetch_task_rows():
+    owner = usage_identity()
+    tasks = tasks_db_request("tasks", query={
+        "select": "id,user_id,title,instructions,schedule_type,timezone,next_run_at,last_run_at,delivery_type,delivery_target,status,created_at",
+        "user_id": "eq." + owner,
+        "order": "created_at.desc",
+        "limit": "300",
+    })
+    if not isinstance(tasks, list):
+        raise RuntimeError("Task list could not be loaded.")
+    return tasks
+
+
+def fetch_task_runs():
+    owner = usage_identity()
+    runs = tasks_db_request("task_runs", query={
+        "select": "id,task_id,status,created_at,finished_at",
+        "user_id": "eq." + owner,
+        "order": "created_at.desc",
+        "limit": "400",
+    })
+    if not isinstance(runs, list):
+        raise RuntimeError("Task activity could not be loaded.")
+    return runs
+
+
+def save_planned_task(title, instructions, schedule_type, local_date,
+                      local_time, delivery_type, delivery_target):
+    title, instructions = (title or "").strip(), (instructions or "").strip()
+    if not title or not instructions:
+        raise ValueError("Add a title and clear instructions.")
+    if len(title) > 140 or len(instructions) > 8000:
+        raise ValueError("The task title or instructions are too long.")
+    if schedule_type not in ("once", "daily", "weekly"):
+        raise ValueError("Choose a supported schedule.")
+    if delivery_type not in ("none", "email", "slack"):
+        raise ValueError("Choose a supported destination.")
+    if delivery_type == "none":
+        delivery_target = None
+    else:
+        delivery_target = (delivery_target or "").strip()
+        if not delivery_target or len(delivery_target) > 250:
+            raise ValueError("Enter your planned delivery destination.")
+        if delivery_type == "email" and ("@" not in delivery_target or " " in delivery_target):
+            raise ValueError("Enter a valid delivery email address.")
+    next_local = datetime.combine(local_date, local_time).replace(tzinfo=CAIRO)
+    if next_local <= datetime.now(CAIRO):
+        raise ValueError("Choose a future date and time.")
+    row = {
+        "user_id": usage_identity(),
+        "title": title,
+        "instructions": instructions,
+        "schedule_type": schedule_type,
+        "timezone": "Africa/Cairo",
+        "next_run_at": next_local.astimezone(timezone.utc).isoformat(),
+        "delivery_type": delivery_type,
+        "delivery_target": delivery_target,
+        "status": "draft",  # Never claim a scheduler has been activated.
+    }
+    return tasks_db_request("tasks", method="POST", body=row)
+
+
+def cancel_planned_task(task_id):
+    owner = usage_identity()
+    try:
+        validated_id = str(uuid.UUID(str(task_id)))
+    except ValueError:
+        raise ValueError("Invalid task ID.") from None
+    return tasks_db_request("tasks", method="PATCH", body={
+        "status": "cancelled",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }, query={"id": "eq." + validated_id, "user_id": "eq." + owner})
+
+
+def local_datetime(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(CAIRO)
+    except (TypeError, ValueError):
+        return None
+
+
+def task_due_text(task):
+    when = local_datetime(task.get("next_run_at"))
+    return when.strftime("%a, %b %d · %I:%M %p") if when else "Not scheduled"
+
+
+def task_estimates(task_rows, run_rows, usage_rows):
+    """Use only completed runs with attributable AI usage; never fabricate costs."""
+    costs_by_run = {}
+    for row in usage_rows:
+        run_id = row.get("task_run_id")
+        if run_id and row.get("cost_status") == "estimated_paid_tier":
+            costs_by_run[run_id] = costs_by_run.get(run_id, Decimal(0)) + amount(row.get("estimated_cost_usd"))
+    per_task = {}
+    for run in run_rows:
+        if run.get("status") != "success" or run.get("id") not in costs_by_run:
+            continue
+        per_task.setdefault(run.get("task_id"), []).append(costs_by_run[run["id"]])
+    return {task_id: (sum(values, Decimal(0)) / len(values))
+            for task_id, values in per_task.items() if values}
+
+
+def display_estimated_run_cost(task_id, estimate_map):
+    estimate = estimate_map.get(task_id)
+    if estimate is None:
+        return "Estimate pending first run"
+    return "~$" + f"{estimate:.4f}" + " per run"
+
+
+def latest_planned_tasks(task_rows, max_items=4):
+    visible = [t for t in task_rows if t.get("status") not in ("cancelled", "completed")]
+    return sorted(visible,
+                  key=lambda t: local_datetime(t.get("next_run_at")) or datetime.max.replace(tzinfo=CAIRO))[:max_items]
+
+
+def activity_counts(usage_summary_data):
+    """Count unique user requests by workspace activity, not API calls."""
+    seen = {"chat": set(), "automation": set()}
+    for row, _ in usage_summary_data.get("rows", []):
+        kind = "automation" if row.get("usage_type") in ("task", "automation", "scheduled") else "chat"
+        seen[kind].add(str(row.get("request_id") or row.get("id")))
+    return len(seen["chat"]), len(seen["automation"])
+
+
+def render_activity_donut(chats, automations, title="This month"):
+    total = chats + automations
+    percent = int(round(chats / total * 100)) if total else 0
+    background = (f"conic-gradient(#5a51df 0 {percent}%, #38bdf8 {percent}% 100%)"
+                  if total else "#e8edf5")
+    st.markdown(
+        '<div class="business-usage">'
+        f'<div class="business-usage-donut" style="background:{background}">'
+        '<div class="business-usage-inner">'
+        f'<strong>{total:,}</strong><span>activities</span>'
+        '</div></div><div class="business-usage-legend">'
+        f'<small>{safe_html(title)}</small>'
+        f'<div><i style="background:#5a51df"></i> Conversations <strong>{chats:,}</strong></div>'
+        f'<div><i style="background:#38bdf8"></i> Automated runs <strong>{automations:,}</strong></div>'
+        '</div></div>', unsafe_allow_html=True,
+    )
+
+
+def render_daily_activity_chart(summary, days=30):
+    today = datetime.now(CAIRO).date()
+    base = today - timedelta(days=days - 1)
+    daily = {base + timedelta(days=i): set() for i in range(days)}
+    for row, when in summary.get("rows", []):
+        if when.date() in daily:
+            daily[when.date()].add(str(row.get("request_id") or row.get("id")))
+    st.bar_chart({"Day": [day.strftime("%b %d") for day in daily],
+                  "Activities": [len(ids) for ids in daily.values()]},
+                 x="Day", y="Activities", height=245)
 
 # ==========================================
 # CONNECTED ACCOUNTS
@@ -985,6 +1174,15 @@ def load_ga4_properties(connection_id):
 # GEMINI API
 # ==========================================
 
+class AIServiceBusy(RuntimeError):
+    """Transient model capacity issue. Display a friendly message to the user."""
+
+
+class AIServiceRateLimited(RuntimeError):
+    """Request quota reached; do not automatically retry."""
+
+
+
 def gemini_generate(contents, system_prompt,
                     tool_definitions, request_id):
     url = (
@@ -1038,16 +1236,34 @@ def gemini_generate(contents, system_prompt,
             }]
         }]
 
-    response = http_json(
-        url,
-        method="POST",
-        body=payload,
-        headers={
-            "Content-Type": "application/json",
-            "x-goog-api-key": st.secrets["GOOGLE_API_KEY"],
-        },
-        timeout=90,
-    )
+    # The provider can temporarily respond with HTTP 503 during high demand.
+    # Retry only transient capacity errors, at most twice, with backoff.
+    # Never repeat a request after receiving a successful response.
+    for attempt in range(3):
+        try:
+            response = http_json(
+                url,
+                method="POST",
+                body=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": st.secrets["GOOGLE_API_KEY"],
+                },
+                timeout=90,
+            )
+            break
+        except RuntimeError as error:
+            message = str(error)
+            if message.startswith("HTTP 503"):
+                if attempt < 2:
+                    time.sleep(1.5 * (2 ** attempt))
+                    continue
+                raise AIServiceBusy("The AI service is busy right now.") from None
+            if message.startswith("HTTP 429"):
+                raise AIServiceRateLimited("The AI service is receiving too many requests.") from None
+            raise
+    # Every successful model response is recorded, including intermediate
+    # tool-calling turns. Never retry a response because the ledger failed.
     record_model_usage(response, request_id)
     return response
 
@@ -1412,6 +1628,25 @@ p {color:#53637a;}
 .usage-legend strong{margin-left:auto;color:#22334e;font-size:12px;}
 .legend-dot{display:inline-block;width:10px;height:10px;border-radius:3px;flex-shrink:0;}
 @media (max-width:900px){.block-container{padding-left:1rem;padding-right:1rem;padding-top:1.3rem;}.page-title{font-size:26px;}.hero-card{padding:22px;}}
+/* V5: business-first workspace and task planning */
+.business-usage{display:flex;align-items:center;justify-content:center;gap:24px;min-height:210px;padding:12px 4px;flex-wrap:wrap;}
+.business-usage-donut{width:170px;height:170px;border-radius:50%;display:grid;place-items:center;flex-shrink:0;}
+.business-usage-inner{width:128px;height:128px;border-radius:50%;background:#fff;display:flex;align-items:center;justify-content:center;flex-direction:column;}
+.business-usage-inner strong{font-size:33px;color:#1c2941;letter-spacing:-.06em;line-height:1.2;}
+.business-usage-inner span{font-size:12px;color:#8190a5;}
+.business-usage-legend{min-width:165px;display:flex;flex-direction:column;gap:14px;font-size:13px;color:#52637c;}
+.business-usage-legend small{font-weight:700;font-size:12px;color:#7b89a0;}
+.business-usage-legend div{display:flex;align-items:center;gap:8px;white-space:nowrap;}
+.business-usage-legend div strong{margin-left:auto;color:#27354d;}
+.business-usage-legend i{width:10px;height:10px;display:inline-block;border-radius:3px;}
+.task-preview{border:1px solid #e5eaf2;border-radius:12px;padding:13px 15px;background:#fff;margin:0 0 9px;}
+.task-preview-title{color:#26344c;font-weight:750;font-size:14px;line-height:1.45;}
+.task-preview-meta{color:#8290a4;font-size:12px;margin-top:7px;line-height:1.65;}
+.task-preview-bottom{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:10px;}
+.task-preview-bottom small{color:#687b92;font-size:11px;}
+.task-badge{font-size:10px;padding:5px 8px;border-radius:20px;background:#f3f0ff;color:#554fbc;font-weight:700;}
+.business-empty{background:#f8faff;border:1px dashed #d8e0ee;border-radius:12px;padding:20px;color:#7989a2;font-size:13px;line-height:1.7;}
+@media(max-width:850px){.business-usage{gap:12px;}.business-usage-donut{width:145px;height:145px;}.business-usage-inner{width:111px;height:111px;}}
 </style>
 """
 
@@ -1645,72 +1880,103 @@ def render_sidebar(user, current_connections):
     return page
 
 
-def render_overview(user, active_connections, connection_errors, rows, usage_error=None):
-    """Executive overview: real usage metrics without duplicate navigation."""
+def render_overview(user, active_connections, connection_errors, rows,
+                    usage_error=None, tasks=None, task_runs=None, tasks_error=None):
+    """Business-owner view: progress, task plans, next dates, and product usage."""
+    tasks, task_runs = tasks or [], task_runs or []
     now, month_start, last_30 = cairo_periods()
-    usage = usage_summary(rows, month_start)
-    usage_30 = usage_summary(rows, last_30)
-    first = (user.get("email") or "there").split("@")[0].replace("."," ").title()
-    page_header("Overview", "A clear view of your AI Employee's activity.", tag="WORKSPACE")
-    if usage_error:
-        st.warning("Usage information is temporarily unavailable. Other workspace features are still accessible.")
+    monthly = usage_summary(rows, month_start)
+    thirty = usage_summary(rows, last_30)
+    conversations, automations = activity_counts(monthly)
+    estimates = task_estimates(tasks, task_runs, rows)
+    planned = [t for t in tasks if t.get("status") not in ("completed", "cancelled")]
+    completed_runs = sum(run.get("status") == "success" and
+                         local_datetime(run.get("finished_at")) is not None and
+                         local_datetime(run.get("finished_at")) >= month_start
+                         for run in task_runs)
+    display_name = (user.get("email") or "there").split("@")[0].replace(".", " ").title()
+    page_header("Overview", "Your work, schedules and usage at a glance.", tag="WORKSPACE")
     st.markdown(
-        '<div class="hero-card"><div class="hero-kicker">YOUR AI EMPLOYEE · WORKSPACE</div>'
-        f'<h2>Welcome back, {safe_html(first)}.</h2>'
-        '<p>Stay on top of your connected sources and AI activity. '
-        'Your latest monthly figures are updated from your workspace.</p></div>',
-        unsafe_allow_html=True,
+        '<div class="hero-card"><div class="hero-kicker">YOUR AI EMPLOYEE</div>'
+        f'<h2>Welcome back, {safe_html(display_name)}.</h2>'
+        '<p>See what is planned, what has been completed, and how your workspace '
+        'is being used—all in one place.</p></div>', unsafe_allow_html=True,
     )
-    k1,k2,k3,k4 = st.columns(4, gap="medium")
-    with k1: metric_card("Connected sources", len(active_connections), "Available to your workspace")
-    with k2: metric_card("AI requests", "—" if usage_error else format_tokens(usage["requests"]), "This month")
-    with k3: metric_card("AI tokens", "—" if usage_error else format_tokens(usage["tokens"]), "This month")
-    with k4: metric_card("Est. AI cost", "—" if usage_error else format_cost(usage["cost"]), "Paid-tier equivalent · this month")
-    section("AI activity", "A quick look at how your assistant is being used")
-    l,r = st.columns([1,1.18],gap="large")
-    with l:
+    k1, k2, k3, k4 = st.columns(4, gap="medium")
+    with k1: metric_card("Connected sources", len(active_connections), "Linked to this workspace")
+    with k2: metric_card("Planned tasks", "—" if tasks_error else str(len(planned)), "Saved task plans")
+    with k3: metric_card("Completed runs", "—" if tasks_error else str(completed_runs), "This month")
+    with k4: metric_card("AI activities", "—" if usage_error else str(monthly["requests"]), "This month")
+
+    section("Your monthly usage", "Conversations and scheduled work in your workspace")
+    left, right = st.columns([1, 1.18], gap="large")
+    with left:
         with st.container(border=True):
-            st.markdown("**Monthly token breakdown**")
+            st.markdown("**Activity breakdown**")
             if usage_error:
-                st.caption("Usage data is currently unavailable.")
+                st.caption("Usage is temporarily unavailable. The rest of your workspace is still accessible.")
             else:
-                usage_donut(usage)
-    with r:
+                render_activity_donut(conversations, automations)
+                st.caption("Includes activity recorded by AI Employee. Automated work will appear after scheduling is enabled.")
+    with right:
         with st.container(border=True):
-            st.markdown("**Last 30 days**")
+            st.markdown("**Activity over the last 30 days**")
             if usage_error:
-                st.caption("Chart will appear when usage data is available.")
+                st.caption("Activity chart is temporarily unavailable.")
             else:
-                usage_daily_chart(usage_30)
-    section("What's next", "Upcoming work and recent activity")
-    l,r = st.columns(2, gap="large")
-    with l:
+                render_daily_activity_chart(thirty)
+
+    section("Your planned work", "Upcoming schedules, destinations, and per-run estimates")
+    left, right = st.columns([1.3, 0.9], gap="large")
+    with left:
         with st.container(border=True):
             st.markdown("**Upcoming tasks**")
-            st.caption("No scheduled tasks yet. Task scheduling is being prepared.")
-            st.info("Scheduled reports and next delivery times will appear here.")
-    with r:
+            if tasks_error:
+                st.warning("Task list is temporarily unavailable.")
+            elif not latest_planned_tasks(tasks):
+                st.markdown('<div class="business-empty">No planned tasks yet. Add your first one in My Tasks.</div>', unsafe_allow_html=True)
+            else:
+                for task in latest_planned_tasks(tasks, 4):
+                    label = task.get("delivery_type") or "none"
+                    delivery = {"none":"No delivery selected", "email":"Email delivery planned", "slack":"Slack delivery planned"}.get(label, "Delivery planned")
+                    st.markdown(
+                        '<div class="task-preview">'
+                        f'<div class="task-preview-title">{safe_html(task.get("title") or "Task")}</div>'
+                        f'<div class="task-preview-meta">Planned: {safe_html(task_due_text(task))} · {safe_html(delivery)}</div>'
+                        '<div class="task-preview-bottom">'
+                        f'<span class="task-badge">{safe_html((task.get("status") or "draft").title())}</span>'
+                        f'<small>{safe_html(display_estimated_run_cost(task.get("id"), estimates))}</small>'
+                        '</div></div>', unsafe_allow_html=True,
+                    )
+                st.caption("Saved plans do not execute or send emails until automations are enabled.")
+    with right:
         with st.container(border=True):
-            st.markdown("**Recent AI activity**")
+            st.markdown("**Recent activity**")
             if usage_error:
-                st.caption("Activity history is temporarily unavailable.")
-            elif usage_30["rows"]:
-                # Show times and counts only: no prompt / business data exposed.
+                st.caption("Recent activity is temporarily unavailable.")
+            elif thirty["rows"]:
                 seen = set()
-                for row, timestamp in usage_30["rows"]:
-                    key = row.get("request_id") or row.get("id")
-                    if key in seen:
+                for row, when in thirty["rows"]:
+                    activity = row.get("request_id") or row.get("id")
+                    if activity in seen:
                         continue
-                    seen.add(key)
-                    st.markdown(f"✦  AI request · {timestamp.strftime('%b %d, %I:%M %p')}")
+                    seen.add(activity)
+                    kind = "Automated activity" if row.get("usage_type") in ("task", "automation", "scheduled") else "AI conversation"
+                    st.markdown(f"**{safe_html(kind)}**")
+                    st.caption(when.strftime("%b %d · %I:%M %p"))
                     if len(seen) >= 4:
                         break
             else:
-                st.caption("Your first AI request will appear here.")
+                st.caption("Your activity history will appear here after your first AI request.")
+            st.divider()
+            st.markdown("**Processing estimate**")
+            if usage_error:
+                st.caption("Not available right now")
+            else:
+                st.markdown(f"**{format_cost(monthly['cost'])}**")
+                st.caption("Estimated AI processing cost this month, not a charge or invoice. Other services are not included.")
     if connection_errors:
-        st.info("Some connections couldn't be checked just now.")
-    st.caption("Costs are indicative paid-tier Gemini token estimates, not actual charges. "
-               "Credits and full integration costs will be added when billing limits are ready.")
+        st.caption("Some connected services couldn't be checked at the moment.")
 
 
 def navigate_to(page):
@@ -1873,7 +2139,15 @@ def render_connection_manager(toolkit, accounts, active_connections):
                     st.warning("Select at least one property")
             approved = st.session_state.get("approved_ga4_properties", [])
             if approved:
-                st.caption(f"{len(approved)} properties available in AI Chat")
+                if st.session_state.get("active_ga4_property") not in approved:
+                    st.session_state.pop("active_ga4_property", None)
+                st.selectbox(
+                    "Default analytics property",
+                    options=approved,
+                    format_func=lambda pid: options.get(pid, pid),
+                    key="active_ga4_property",
+                )
+                st.caption(f"{len(approved)} properties available. Your default source is used in AI Chat.")
     with st.expander("Disconnect"):
         confirmed = st.checkbox("I want to disconnect", key=f"confirm_{account['id']}")
         if st.button("Disconnect account", key=f"disconnect_{account['id']}",
@@ -1939,134 +2213,177 @@ def render_integrations(accounts_by_toolkit, active_connections, errors):
 
 
 def render_ai_chat(active_connections):
-    page_header(
-        "AI Chat", "Ask questions and get answers from your connected business data.",
-        tag="LIVE AI ASSISTANT",
-    )
+    page_header("AI Chat", "Talk to your AI Employee about your business.", tag="YOUR ASSISTANT")
     approved = st.session_state.get("approved_ga4_properties", [])
     active_property = None
     if "google_analytics" in active_connections and approved:
-        active_property = st.selectbox(
-            "GA4 property for this conversation", approved,
-            key="active_ga4_property",
-        )
+        active_property = st.session_state.get("active_ga4_property")
+        if active_property not in approved:
+            active_property = approved[0]
+            st.session_state["active_ga4_property"] = active_property
     left, right = st.columns([2.35, 1], gap="large")
     with left:
         with st.container(border=True):
-            st.markdown("**✧ Your AI Analyst**")
-            st.caption("Real answers from the data sources you choose")
+            st.markdown("**✧ Your AI Employee**")
+            st.caption("Ask a question, and get a clear answer from your connected business data.")
             if not active_connections:
-                st.info("No data sources connected. Go to Integrations to connect GA4 or HubSpot.")
+                st.info("To get started, connect a data source in Integrations.")
             if "messages" not in st.session_state:
                 st.session_state.messages = []
-            if st.button("Clear conversation", key="clear_conversation"):
+            if st.button("New conversation", key="clear_conversation"):
                 st.session_state.messages = []
                 st.rerun()
             st.divider()
             for msg in st.session_state.messages:
                 with st.chat_message(msg["role"]):
                     st.markdown(msg["content"])
-            if prompt := st.chat_input("Ask your AI Employee..."):
+            if prompt := st.chat_input("What can I help you with?"):
                 conversation = st.session_state.messages + [{"role": "user", "content": prompt}]
                 with st.chat_message("user"):
                     st.markdown(prompt)
                 with st.chat_message("assistant"):
-                    with st.spinner("Analyzing your request..."):
+                    with st.spinner("Working on your request..."):
                         try:
-                            answer, tools_used = ask_ai(
-                                conversation, active_connections, active_property,
-                            )
+                            answer, _ = ask_ai(conversation, active_connections, active_property)
                             st.markdown(answer)
-                            # Tool diagnostics are intentionally omitted from the customer UI.
-                            # Read-only tools are still enforced server-side.
                             st.session_state.messages.extend([
                                 {"role": "user", "content": prompt},
                                 {"role": "assistant", "content": answer},
                             ])
-                        except RuntimeError as err:
-                            st.error(str(err))
+                        except AIServiceBusy:
+                            st.warning("Your AI Employee is receiving heavy demand right now. Please try your question again shortly.")
+                        except AIServiceRateLimited:
+                            st.warning("You've reached the current request limit. Please try again later.")
+                        except RuntimeError as error:
+                            LOGGER.warning("AI request failed: %s", str(error)[:400])
+                            if "Usage recording is unavailable" in str(error):
+                                st.warning("This request couldn't be completed while your activity history was unavailable. Please try again.")
+                            else:
+                                st.warning("The request couldn't be completed just now. Please try again or use a different question.")
     with right:
-        section("Context", "Data sources this session")
+        section("Your workspace")
         with st.container(border=True):
-            if not active_connections:
-                st.caption("No sources connected yet")
+            st.markdown("**Connected sources**")
+            sources = [name for name, config in APPS.items() if config["toolkit"] in active_connections]
+            if sources:
+                for name in sources:
+                    st.markdown(f"✓ {safe_html(name)}")
             else:
-                for name, config in APPS.items():
-                    if config["toolkit"] in active_connections:
-                        st.markdown(f"**✓ {name}**")
-            if active_property:
-                st.caption("GA4 property: " + str(active_property))
-            elif "google_analytics" in active_connections:
-                st.warning("Select a GA4 property in Integrations first")
-            st.divider()
-            st.markdown("**Your data stays in your control**")
-            st.caption("Your AI Employee currently uses read-only access to connected sources.")
-        section("Try asking")
+                st.caption("Connect a source to work with live business data.")
+            if "google_analytics" in active_connections and not active_property:
+                st.info("Choose an analytics account in Integrations to start analyzing its data.")
+        section("Ideas to get started")
         st.markdown(
-            "- How many sessions did we get last week?\n"
-            "- Which channel drove the most traffic?\n"
-            "- Summarize our performance this month."
+            "- How is my website performing this week?\n"
+            "- What's changed since last month?\n"
+            "- Which marketing channels are improving?"
         )
 
 
-def render_tasks():
-    page_header("My Tasks", "Plan, manage and monitor your AI Employee's work.", tag="IN DEVELOPMENT")
-    a, b, c = st.columns(3, gap="medium")
-    with a: metric_card("All tasks", "—", "Awaiting Supabase integration")
-    with b: metric_card("Scheduled", "—", "Scheduler not enabled")
-    with c: metric_card("Completed runs", "—", "No execution service yet")
-    section("Task workspace")
-    empty_feature(
-        "☑", "Your task manager is ready for the next development phase.",
-        "We'll connect the existing Supabase tasks and task_runs tables here, "
-        "then enable approvals, schedules and execution history. "
-        "This page does not create or run tasks yet.",
-    )
+def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=None):
+    task_rows, task_runs, usage_rows = task_rows or [], task_runs or [], usage_rows or []
+    page_header("My Tasks", "Plan your work and see its status in one place.", tag="TASK PLANNER")
+    active = [t for t in task_rows if t.get("status") not in ("cancelled", "completed")]
+    next_plans = latest_planned_tasks(task_rows)
+    completed = sum(run.get("status") == "success" for run in task_runs)
+    col1, col2, col3 = st.columns(3, gap="medium")
+    with col1: metric_card("Planned tasks", "—" if tasks_error else len(active), "Saved in your workspace")
+    with col2: metric_card("Next planned date", "—" if not next_plans else task_due_text(next_plans[0]).split(" · ")[0], "Scheduling not active yet")
+    with col3: metric_card("Completed runs", "—" if tasks_error else completed, "From your task history")
+    st.info("You can save and organize task plans now. Automated execution and email/Slack delivery are not active yet.")
+    left, right = st.columns([1.2, 1], gap="large")
+    with left:
+        section("Your task list", "Plans, next dates and delivery preferences")
+        if tasks_error:
+            st.warning("Your task list is temporarily unavailable. Please try again shortly.")
+        elif not task_rows:
+            empty_feature("☑", "No tasks yet", "Create a plan to see it here and on your Overview.")
+        else:
+            estimates = task_estimates(task_rows, task_runs, usage_rows)
+            for task in task_rows:
+                with st.container(border=True):
+                    title = safe_html(task.get("title") or "Untitled")
+                    state = safe_html((task.get("status") or "draft").title())
+                    st.markdown(f"**{title}**  ·  {state}")
+                    st.caption(f"Planned: {task_due_text(task)} · {str(task.get('schedule_type') or 'once').title()}")
+                    delivery = task.get("delivery_type") or "none"
+                    if delivery != "none":
+                        st.caption(f"Delivery preference: {delivery.title()} (not active)")
+                    st.caption("Estimated processing: " + display_estimated_run_cost(task.get("id"), estimates))
+                    with st.expander("Instructions"):
+                        st.write(task.get("instructions") or "No details")
+                    if task.get("status") != "cancelled":
+                        if st.button("Cancel plan", key="cancel_task_" + str(task.get("id"))):
+                            try:
+                                cancel_planned_task(task["id"])
+                                st.success("Plan cancelled")
+                                st.rerun()
+                            except (RuntimeError, ValueError) as error:
+                                LOGGER.warning("Task cancellation failed: %s", str(error)[:250])
+                                st.error("This plan couldn't be changed. Please try again.")
+    with right:
+        section("Create a task plan", "Save it now; enable automatic delivery later")
+        with st.container(border=True):
+            with st.form("create_task_plan", clear_on_submit=False):
+                title = st.text_input("Task name", placeholder="Weekly marketing performance")
+                details = st.text_area("What should your AI Employee do?", placeholder="Compare last week's channels and highlight changes", height=100)
+                schedule = st.selectbox("Repeat", ["once", "daily", "weekly"], format_func=lambda x: {"once":"One time", "daily":"Every day", "weekly":"Every week"}[x])
+                date_col, time_col = st.columns(2)
+                with date_col:
+                    planned_date = st.date_input("First planned date", value=datetime.now(CAIRO).date() + timedelta(days=1))
+                with time_col:
+                    planned_time = st.time_input("Planned time (Cairo)", value=datetime.now(CAIRO).replace(hour=9, minute=0, second=0, microsecond=0).time())
+                delivery = st.selectbox("Delivery preference", ["none", "email", "slack"], format_func=lambda x: {"none":"Keep in workspace", "email":"Email (planned)", "slack":"Slack (planned)"}[x])
+                destination = st.text_input("Destination (if applicable)", placeholder="Email address or Slack channel")
+                submit = st.form_submit_button("Save task plan", type="primary", use_container_width=True)
+            if submit:
+                try:
+                    save_planned_task(title, details, schedule, planned_date, planned_time, delivery, destination)
+                    st.success("Task plan saved. It will appear in Overview.")
+                    st.rerun()
+                except ValueError as error:
+                    st.warning(str(error))
+                except RuntimeError as error:
+                    LOGGER.warning("Task creation failed: %s", str(error)[:300])
+                    st.error("Couldn't save your task yet. Check the database setup and try again.")
+            st.caption("These dates are planning details. No task will run or send a report until the execution service is enabled.")
 
 
 def render_usage(rows, usage_error=None):
-    page_header("Usage", "Understand how your AI Employee is being used.", tag="YOUR ACTIVITY")
-    if usage_error:
-        st.warning("Usage information is temporarily unavailable. Your account and integrations are unaffected.")
+    page_header("Usage", "See how your AI Employee is being used.", tag="YOUR ACTIVITY")
     now, month_start, last_30 = cairo_periods()
     summary = usage_summary(rows, month_start)
     thirty = usage_summary(rows, last_30)
-    k1,k2,k3,k4 = st.columns(4, gap="medium")
-    with k1: metric_card("AI requests", "—" if usage_error else format_tokens(summary["requests"]), "This month")
-    with k2: metric_card("Model calls", "—" if usage_error else format_tokens(summary["api_calls"]), "All calls, including tool turns")
-    with k3: metric_card("Total tokens", "—" if usage_error else format_tokens(summary["tokens"]), "This month")
-    with k4: metric_card("Est. AI cost", "—" if usage_error else format_cost(summary["cost"]), "Paid-tier equivalent")
-    section("Usage trends", "Based on your own account activity")
-    left, right = st.columns([1,1.2], gap="large")
+    chat_count, automation_count = activity_counts(summary)
+    if usage_error:
+        st.warning("Usage information is temporarily unavailable. Other workspace features are unaffected.")
+    k1, k2, k3 = st.columns(3, gap="medium")
+    with k1: metric_card("Total activities", "—" if usage_error else summary["requests"], "This month")
+    with k2: metric_card("Conversations", "—" if usage_error else chat_count, "Questions and analyses")
+    with k3: metric_card("Automated runs", "—" if usage_error else automation_count, "Tracked reports and workflows")
+    section("Activity overview", "A clear picture of your usage")
+    left, right = st.columns([1, 1.2], gap="large")
     with left:
         with st.container(border=True):
-            st.markdown("**Monthly token breakdown**")
+            st.markdown("**Usage by activity**")
             if usage_error:
-                st.caption("Usage chart unavailable.")
+                st.caption("Chart unavailable")
             else:
-                usage_donut(summary)
+                render_activity_donut(chat_count, automation_count)
     with right:
         with st.container(border=True):
-            st.markdown("**Last 30 days**")
+            st.markdown("**Activity trend · last 30 days**")
             if usage_error:
-                st.caption("Usage chart unavailable.")
+                st.caption("Chart unavailable")
             else:
-                usage_daily_chart(thirty)
-    if usage_error:
-        st.info("Try refreshing this page. If the problem continues, check the app logs for the Supabase status code.")
-        return
-    section("Your usage details")
-    with st.container(border=True):
-        st.markdown(f"**Input tokens:** {format_tokens(summary['input'])}")
-        st.markdown(f"**Output tokens:** {format_tokens(summary['output'])}")
-        st.markdown(f"**Thinking tokens:** {format_tokens(summary['thinking'])}")
-        st.markdown(f"**Tool requests:** {format_tokens(summary['tools'])}")
-        st.caption("Tool requests count actions the model asked for. They are not Composio billable units.")
-        if summary["unpriced"]:
-            st.warning(f"{summary['unpriced']} model calls were missing usage metadata and are not priced.")
-    st.info("Cost figures use published paid-tier Gemini token rates. "
-            "They don't include Composio, hosting, taxes, or any free-tier allowances. "
-            "Credits and hard spending limits are not enabled yet.")
+                render_daily_activity_chart(thirty)
+    with st.expander("Processing cost estimate"):
+        if usage_error:
+            st.caption("Estimate temporarily unavailable")
+        else:
+            st.markdown(f"**{format_cost(summary['cost'])}** — estimated AI processing this month")
+            st.caption("This is an indicative paid-tier processing estimate, not an invoice. It does not include integration, hosting, or other platform costs.")
+        st.caption("Usage credits and monthly limits will become available after the credits system is activated.")
 
 
 def render_settings(user):
@@ -2111,21 +2428,29 @@ page = render_sidebar(user, active_connections)
 
 usage_rows = []
 usage_error = None
-if page in ("Overview", "Usage"):
+if page in ("Overview", "Usage", "My Tasks"):
     try:
         usage_rows = fetch_usage_rows()
     except RuntimeError as error:
         usage_error = str(error)
-        # Avoid showing raw API responses to customers, but preserve diagnostic
-        # information in server logs (no API keys or access tokens logged).
-        LOGGER.warning("Supabase usage read failed: %s", error)
+        LOGGER.warning("Supabase usage read failed: %s", str(error)[:300])
+
+task_rows, task_runs, tasks_error = [], [], None
+if page in ("Overview", "My Tasks"):
+    try:
+        task_rows = fetch_task_rows()
+        task_runs = fetch_task_runs()
+    except RuntimeError as error:
+        tasks_error = str(error)
+        LOGGER.warning("Supabase task read failed: %s", str(error)[:300])
 
 if page == "Overview":
-    render_overview(user, active_connections, connection_errors, usage_rows, usage_error)
+    render_overview(user, active_connections, connection_errors, usage_rows,
+                    usage_error, task_rows, task_runs, tasks_error)
 elif page == "AI Chat":
     render_ai_chat(active_connections)
 elif page == "My Tasks":
-    render_tasks()
+    render_tasks(task_rows, task_runs, usage_rows, tasks_error)
 elif page == "Integrations":
     render_integrations(accounts_by_toolkit, active_connections, connection_errors)
 elif page == "Usage":
