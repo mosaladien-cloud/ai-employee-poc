@@ -960,9 +960,144 @@ def fetch_task_runs():
     return runs
 
 
+# REPORT DATE SELECTION - STORED WITH EACH TASK, NO SCHEMA CHANGE
+# The worker uses this explicit metadata instead of asking the AI to guess dates.
+REPORT_PERIOD_PATTERN = re.compile(
+    r"\n\n\[\[AI_EMPLOYEE_PERIOD_V1\]\](\{[^\r\n]{1,250}\})\[\[/AI_EMPLOYEE_PERIOD_V1\]\]$"
+)
+
+
+def split_report_period(instructions):
+    """Return visible user instructions and optional structured date preference."""
+    raw = str(instructions or "").strip()
+    match = REPORT_PERIOD_PATTERN.search(raw)
+    if not match:
+        return raw, None
+    try:
+        parsed = json.loads(match.group(1))
+    except (ValueError, TypeError):
+        return raw, None
+    if not isinstance(parsed, dict) or parsed.get("mode") not in ("rolling_days", "fixed"):
+        return raw, None
+    return raw[:match.start()].strip(), parsed
+
+
+def add_report_period(instructions, selection):
+    """Attach customer-selected dates to saved instructions without changing tables."""
+    visible, _ = split_report_period(instructions)
+    if not visible:
+        raise ValueError("Add clear report instructions.")
+    if not selection or selection.get("mode") == "instructions":
+        result = visible
+    elif selection.get("mode") == "rolling_days":
+        days = selection.get("days")
+        if type(days) is not int or not 1 <= days <= 99_999_999:
+            raise ValueError("Choose a valid number of days.")
+        payload = {"mode": "rolling_days", "days": days}
+        result = visible + "\n\n[[AI_EMPLOYEE_PERIOD_V1]]" + json.dumps(
+            payload, separators=(",", ":")
+        ) + "[[/AI_EMPLOYEE_PERIOD_V1]]"
+    elif selection.get("mode") == "fixed":
+        start, end = selection.get("start"), selection.get("end")
+        try:
+            start_day, end_day = date.fromisoformat(start), date.fromisoformat(end)
+        except (TypeError, ValueError):
+            raise ValueError("Choose valid reporting start and end dates.") from None
+        if start_day > end_day or end_day > datetime.now(CAIRO).date():
+            raise ValueError("The report start date must be before the end date, and neither can be in the future.")
+        payload = {"mode": "fixed", "start": start, "end": end}
+        result = visible + "\n\n[[AI_EMPLOYEE_PERIOD_V1]]" + json.dumps(
+            payload, separators=(",", ":")
+        ) + "[[/AI_EMPLOYEE_PERIOD_V1]]"
+    else:
+        raise ValueError("Choose a supported reporting period.")
+    if len(result) > 8000:
+        raise ValueError("Task instructions are too long.")
+    return result
+
+
+def report_period_label(instructions):
+    _, chosen = split_report_period(instructions)
+    if not chosen:
+        return "From report instructions"
+    if chosen["mode"] == "rolling_days":
+        return "Last " + str(chosen.get("days")) + " completed days (updates each run)"
+    return str(chosen.get("start")) + " to " + str(chosen.get("end")) + " (fixed dates)"
+
+
+def render_report_period_picker(key_prefix, current=None):
+    """Pick dates for GA4 data, independently from the task's scheduled run time."""
+    current = current or {}
+    labels = {
+        "instructions": "Use dates from instructions",
+        "rolling_days": "Last N completed days",
+        "fixed": "Choose start and end dates",
+    }
+    current_mode = current.get("mode")
+    mode = st.selectbox(
+        "Reporting period (GA4 data dates)",
+        list(labels),
+        index=list(labels).index(current_mode) if current_mode in labels else 0,
+        format_func=lambda v: labels[v],
+        key=key_prefix + "_mode",
+    )
+    if mode == "rolling_days":
+        existing = current.get("days") if current_mode == mode else 7
+        initial = existing if type(existing) is int and 1 <= existing <= 99_999_999 else 7
+        count = st.number_input(
+            "Number of completed days", min_value=1, max_value=99_999_999,
+            value=initial, step=1, key=key_prefix + "_days",
+        )
+        st.caption("A rolling range: every run analyzes that many completed days ending yesterday.")
+        return {"mode": "rolling_days", "days": int(count)}
+    if mode == "fixed":
+        today = datetime.now(CAIRO).date()
+        fallback_end = today - timedelta(days=1)
+        fallback_start = fallback_end - timedelta(days=6)
+        try:
+            initial_start = date.fromisoformat(current["start"]) if current_mode == mode else fallback_start
+            initial_end = date.fromisoformat(current["end"]) if current_mode == mode else fallback_end
+        except (ValueError, KeyError, TypeError):
+            initial_start, initial_end = fallback_start, fallback_end
+        start_col, end_col = st.columns(2)
+        with start_col:
+            start_date = st.date_input(
+                "From", value=initial_start, max_value=today,
+                key=key_prefix + "_start",
+            )
+        with end_col:
+            end_date = st.date_input(
+                "To", value=initial_end, max_value=today,
+                key=key_prefix + "_end",
+            )
+        if start_date > end_date:
+            st.warning("Start date must be on or before end date.")
+        st.caption("Fixed dates stay the same on every run, including scheduled reports.")
+        return {"mode": "fixed", "start": start_date.isoformat(), "end": end_date.isoformat()}
+    st.caption("The AI interprets the dates in your instructions. Choose a range above for more reliable results.")
+    return None
+
+
+def update_saved_report_period(task, selection):
+    if task.get("status") not in ("draft", "active", "paused"):
+        raise ValueError("This report can no longer be edited.")
+    if task.get("user_id") != usage_identity():
+        raise ValueError("Report does not belong to your workspace.")
+    updated = add_report_period(task.get("instructions"), selection)
+    if updated == task.get("instructions"):
+        return
+    tasks_db_request(
+        "tasks", method="PATCH",
+        body={"instructions": updated,
+              "updated_at": datetime.now(timezone.utc).isoformat()},
+        query={"id": "eq." + str(uuid.UUID(str(task["id"]))),
+               "user_id": "eq." + usage_identity()},
+    )
+
+
 def save_planned_task(title, instructions, schedule_type, local_date,
-                      local_time, delivery_type, delivery_target):
-    title, instructions = (title or "").strip(), (instructions or "").strip()
+                      local_time, delivery_type, delivery_target, report_period=None):
+    title, instructions = (title or "").strip(), add_report_period(instructions, report_period)
     if not title or not instructions:
         raise ValueError("Add a title and clear instructions.")
     if len(title) > 140 or len(instructions) > 8000:
