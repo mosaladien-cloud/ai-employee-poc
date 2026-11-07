@@ -1,5 +1,5 @@
-
 import json
+import time
 import urllib.request
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, quote
@@ -21,9 +21,11 @@ APP_URL = "https://ai-employee-poc.streamlit.app"
 COMPOSIO_BASE = "https://backend.composio.dev/api/v3.1"
 GEMINI_MODEL = "gemini-3.5-flash-lite"
 
-# WARNING: Single-user private prototype only.
-# Replace with authenticated user IDs for a real SaaS.
-TEST_USER_ID = "ai-employee-poc-owner"
+SUPABASE_URL = st.secrets["SUPABASE_URL"].rstrip("/")
+SUPABASE_PUBLISHABLE_KEY = st.secrets["SUPABASE_PUBLISHABLE_KEY"]
+
+# Separate, verified Composio identity for each Supabase user.
+# Do not reuse the old shared test identity.
 
 APPS = {
     "Google Analytics": {
@@ -125,6 +127,217 @@ def composio_request(path, method="GET",
 
 
 # ==========================================
+# SUPABASE AUTH - EMAIL / PASSWORD
+# ==========================================
+
+
+def auth_request(path, method="POST", body=None,
+                 access_token=None, query=None):
+    url = SUPABASE_URL + "/auth/v1" + path
+    if query:
+        url += "?" + urlencode(query)
+
+    headers = {
+        "apikey": SUPABASE_PUBLISHABLE_KEY,
+        "Content-Type": "application/json",
+    }
+    if access_token:
+        headers["Authorization"] = "Bearer " + access_token
+
+    return http_json(
+        url, method=method, body=body, headers=headers
+    )
+
+
+def clear_user_workspace():
+    # Clear personal and widget state when the auth identity changes.
+    keys = (
+        "connect_links", "ga4_properties", "ga4_selected",
+        "approved_ga4_properties", "ga4_property_connection",
+        "active_ga4_property", "messages", "authenticated_user",
+        "verified_user_id", "active_google_analytics",
+        "active_hubspot", "load_ga4", "auth_notice",
+    )
+    for key in keys:
+        st.session_state.pop(key, None)
+
+    # Remove account-specific controls from earlier sessions.
+    for key in list(st.session_state.keys()):
+        if key.startswith(("confirm_", "connect_", "disconnect_", "refresh_")):
+            st.session_state.pop(key, None)
+
+
+def clear_auth():
+    st.session_state.pop("auth_tokens", None)
+    clear_user_workspace()
+
+
+def save_auth_tokens(data):
+    if not isinstance(data, dict):
+        raise RuntimeError("Invalid authentication response.")
+
+    access = data.get("access_token")
+    refresh = data.get("refresh_token")
+    if not access or not refresh:
+        raise RuntimeError("No login session was returned.")
+
+    user = auth_request("/user", method="GET", access_token=access)
+    user_id = user.get("id")
+    if not user_id:
+        raise RuntimeError("Could not verify the authenticated user.")
+
+    previous = st.session_state.get("verified_user_id")
+    if previous != user_id:
+        clear_user_workspace()
+
+    st.session_state["auth_tokens"] = {
+        "access_token": access,
+        "refresh_token": refresh,
+        "expires_at": time.time() + int(data.get("expires_in", 3600)),
+    }
+    st.session_state["authenticated_user"] = user
+    st.session_state["verified_user_id"] = user_id
+
+
+def refresh_auth():
+    tokens = st.session_state.get("auth_tokens") or {}
+    refresh = tokens.get("refresh_token")
+    if not refresh:
+        raise RuntimeError("No refresh token is available.")
+
+    data = auth_request(
+        "/token", query={"grant_type": "refresh_token"},
+        body={"refresh_token": refresh},
+    )
+    save_auth_tokens(data)
+
+
+def get_signed_in_user():
+    tokens = st.session_state.get("auth_tokens")
+    if not tokens:
+        return None
+
+    try:
+        # Refresh shortly before expiry and verify on every rerun.
+        if time.time() >= tokens.get("expires_at", 0) - 60:
+            refresh_auth()
+
+        tokens = st.session_state.get("auth_tokens") or {}
+        try:
+            user = auth_request(
+                "/user", method="GET",
+                access_token=tokens["access_token"],
+            )
+        except RuntimeError as error:
+            if "HTTP 401" not in str(error):
+                raise
+            refresh_auth()
+            tokens = st.session_state["auth_tokens"]
+            user = auth_request(
+                "/user", method="GET",
+                access_token=tokens["access_token"],
+            )
+
+        user_id = user.get("id")
+        if not user_id:
+            raise RuntimeError("Invalid account identity.")
+        if st.session_state.get("verified_user_id") != user_id:
+            clear_user_workspace()
+
+        st.session_state["authenticated_user"] = user
+        st.session_state["verified_user_id"] = user_id
+        return user
+    except (RuntimeError, KeyError, TypeError, ValueError):
+        clear_auth()
+        return None
+
+
+def composio_user_id():
+    user_id = st.session_state.get("verified_user_id")
+    if not user_id:
+        raise RuntimeError("Sign in before using integrations.")
+    return "supabase_" + user_id
+
+
+def render_login():
+    st.title("🤖 AI Employee")
+    st.caption("Private beta · Secure workspace")
+    st.info("Sign in or create a test account to access your own integrations.")
+
+    tab_signin, tab_signup = st.tabs(["Sign In", "Create Account"])
+
+    with tab_signin:
+        with st.form("signin_form", clear_on_submit=False):
+            email = st.text_input("Email", key="signin_email").strip().lower()
+            password = st.text_input(
+                "Password", type="password", key="signin_password"
+            )
+            submit = st.form_submit_button("Sign In", type="primary")
+
+        if submit:
+            if not email or not password:
+                st.error("Enter your email and password.")
+            else:
+                try:
+                    data = auth_request(
+                        "/token", query={"grant_type": "password"},
+                        body={"email": email, "password": password},
+                    )
+                    save_auth_tokens(data)
+                    st.rerun()
+                except RuntimeError as error:
+                    st.error(str(error))
+
+    with tab_signup:
+        with st.form("signup_form", clear_on_submit=False):
+            new_email = st.text_input(
+                "Email", key="signup_email"
+            ).strip().lower()
+            new_password = st.text_input(
+                "Password (at least 8 characters)",
+                type="password", key="signup_password",
+            )
+            confirm_password = st.text_input(
+                "Confirm password", type="password",
+                key="signup_confirm_password",
+            )
+            signup = st.form_submit_button("Create Account")
+
+        if signup:
+            if not new_email or "@" not in new_email:
+                st.error("Enter a valid email address.")
+            elif len(new_password) < 8:
+                st.error("Use a password with at least 8 characters.")
+            elif new_password != confirm_password:
+                st.error("Passwords do not match.")
+            else:
+                try:
+                    result = auth_request(
+                        "/signup",
+                        body={
+                            "email": new_email,
+                            "password": new_password,
+                        },
+                    )
+                    if result.get("access_token"):
+                        save_auth_tokens(result)
+                        st.rerun()
+                    else:
+                        st.success(
+                            "If signup is accepted, check your inbox "
+                            "for a confirmation link. Then come back "
+                            "and sign in using your email and password."
+                        )
+                except RuntimeError as error:
+                    st.error(str(error))
+
+    st.caption(
+        "Email confirmation opens the app, but this prototype "
+        "requires you to sign in manually after confirmation."
+    )
+
+
+# ==========================================
 # CONNECTED ACCOUNTS
 # ==========================================
 
@@ -134,7 +347,7 @@ def get_connections(toolkit):
 
     for _ in range(10):
         params = {
-            "user_ids": [TEST_USER_ID],
+            "user_ids": [composio_user_id()],
             "toolkit_slugs": [toolkit],
             "statuses": ["ACTIVE"],
             "limit": 100,
@@ -154,7 +367,7 @@ def get_connections(toolkit):
             ).get("slug")
 
             if (
-                item.get("user_id") == TEST_USER_ID
+                item.get("user_id") == composio_user_id()
                 and item_toolkit == toolkit
                 and item.get("status") == "ACTIVE"
             ):
@@ -172,7 +385,7 @@ def create_connect_link(auth_config_id):
         "/connected_accounts/link",
         method="POST",
         body={
-            "user_id": TEST_USER_ID,
+            "user_id": composio_user_id(),
             "auth_config_id": auth_config_id,
             "callback_url": APP_URL,
         },
@@ -200,7 +413,7 @@ def disconnect_account(connection_id, toolkit):
     ).get("slug")
 
     if (
-        account.get("user_id") != TEST_USER_ID
+        account.get("user_id") != composio_user_id()
         or account_toolkit != toolkit
     ):
         raise RuntimeError(
@@ -239,7 +452,7 @@ def create_tool_session(toolkit, connection_id):
         "/tool_router/session",
         method="POST",
         body={
-            "user_id": TEST_USER_ID,
+            "user_id": composio_user_id(),
             "toolkits": {
                 "enable": [toolkit]
             },
@@ -785,13 +998,30 @@ when comparisons need multiple queries.
 # MAIN APP
 # ==========================================
 
+# Authentication is a hard gate: no Composio or Gemini call before verification.
+user = get_signed_in_user()
+if not user:
+    render_login()
+    st.stop()
+
+st.sidebar.markdown("### 🤖 AI Employee")
+st.sidebar.caption(user.get("email", "Signed in"))
+if st.sidebar.button("Sign Out", type="secondary"):
+    tokens = st.session_state.get("auth_tokens") or {}
+    try:
+        if tokens.get("access_token"):
+            auth_request(
+                "/logout", method="POST", body={},
+                access_token=tokens["access_token"],
+            )
+    except RuntimeError:
+        pass  # Always clear local session even if remote revoke fails.
+    clear_auth()
+    st.rerun()
+
 st.title("🤖 AI Employee")
 st.caption("Your AI-powered business data analyst")
-
-st.warning(
-    "Private prototype: one test user only. "
-    "Do not use customer data in this version."
-)
+st.info("Private beta · Signed in as " + user.get("email", "user"))
 
 if "connect_links" not in st.session_state:
     st.session_state.connect_links = {}
