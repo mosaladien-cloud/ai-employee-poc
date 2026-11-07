@@ -2646,6 +2646,9 @@ def render_ai_chat(active_connections):
 def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=None):
     task_rows,task_runs,usage_rows=task_rows or [],task_runs or [],usage_rows or []
     page_header("My Tasks","Create, run and review your AI Employee's reports.",tag="YOUR REPORTS")
+    # Show a one-time completion notice after a fresh rerun reloads task_runs.
+    if st.session_state.pop("_task_run_just_completed", False):
+        st.success("Report completed. Its result is available in Run history below.")
     completed=sum(r.get("status")=="success" for r in task_runs)
     pending=sum(r.get("status") in ("queued","running") for r in task_runs)
     a,b,c=st.columns(3,gap="medium")
@@ -2687,7 +2690,10 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                                     outcome=run_saved_task(task)
                                     result_status=outcome.get("status")
                                     if result_status=="success":
-                                        st.success("Report completed. View its result below.")
+                                        # The task list was queried before this button was clicked.
+                                        # Refresh the run history automatically, without a browser reload.
+                                        st.session_state["_task_run_just_completed"] = True
+                                        st.rerun()
                                     elif result_status=="idle":
                                         st.info("This task is already being processed. Refresh your task history.")
                                     else:
