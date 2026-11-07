@@ -2983,8 +2983,10 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                 st.caption(f"Next planned: {task_due_text(task)} · {(task.get('schedule_type') or 'once').title()}")
                 st.caption("Estimated processing: "+display_estimated_run_cost(task_id,estimates))
                 st.caption("Reporting period: " + report_period_label(task.get("instructions")))
-                if task.get("delivery_type") not in ("none",None):
-                    st.caption("Delivery is attempted after a successful report. Check Run history for confirmation.")
+                delivery_name = {"email": "Gmail", "slack": "Slack"}.get(
+                    task.get("delivery_type"), "Workspace only"
+                )
+                st.caption("Delivery: " + delivery_name)
                 with st.expander("Report instructions"):
                     visible_instructions, _ = split_report_period(task.get("instructions"))
                     st.write(visible_instructions or "No instructions")
@@ -3087,82 +3089,97 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                     else:
                         st.caption("Report saved. Delivery has not been attempted yet.")
     with right:
-        section("Report delivery", "Connect your accounts and choose a destination")
-        selected_slack_target = None
-        with st.container(border=True):
-            slack_account = active_connections.get("slack")
-            if slack_account:
-                st.success("Slack workspace connected")
-                try:
-                    channels = load_slack_channels(usage_identity(), slack_account["id"])
-                    if channels:
-                        by_id = {ch["id"]: ch for ch in channels}
-                        selected_channel = st.selectbox(
-                            "Slack channel", list(by_id),
-                            format_func=lambda cid: (
-                                ("🔒 " if by_id[cid]["private"] else "#")
-                                + by_id[cid]["name"]
-                                + (" · Invite app first" if by_id[cid]["member"] is False else "")
-                            ),
-                            key="task_slack_channel",
-                        )
-                        if by_id[selected_channel]["member"] is False:
-                            st.caption("Invite the connected Slack app to this channel before delivery.")
-                        else:
-                            selected_slack_target = slack_delivery_target(
-                                slack_account["id"], selected_channel)
-                        if st.button("Refresh channels", key="refresh_task_slack_channels"):
-                            load_slack_channels.clear(usage_identity(), slack_account["id"])
-                            st.rerun()
-                    else:
-                        st.warning("No accessible channels found in this workspace.")
-                except (RuntimeError, ValueError, KeyError, TypeError) as error:
-                    LOGGER.warning("Slack channel lookup failed: %s", str(error)[:220])
-                    st.warning("Couldn't load channels. Review the connection in Integrations.")
-                st.caption("The selected channel can be saved with a task. Delivery is confirmed in Run history.")
-                button_text = "Manage Slack connection"
-            else:
-                st.info("Slack is not connected")
-                st.caption("Connect your Slack workspace in Integrations to load the real channel list.")
-                button_text = "Connect Slack"
-            if st.button(button_text, key="tasks_slack_integration", use_container_width=True):
-                navigate_to("Integrations")
-                st.rerun()
-            st.caption("For successful reports, check Run history for Slack delivery status.")
-        selected_gmail_target = None
-        with st.container(border=True):
-            gmail_account = active_connections.get("gmail")
-            if gmail_account:
-                st.success("Gmail account connected")
-                recipients = st.multiselect(
-                    "Recipient emails", options=[],
-                    accept_new_options=True, max_selections=5,
-                    placeholder="Type an email address and press Enter",
-                    key="task_gmail_recipients",
-                    help="Add up to five recipients. They do not need Gmail accounts.",
-                )
-                if recipients:
-                    try:
-                        selected_gmail_target = gmail_delivery_target(
-                            gmail_account["id"], recipients)
-                    except ValueError as error:
-                        st.warning(str(error))
-                else:
-                    st.caption("Add at least one recipient to select Gmail for a new report.")
-                gmail_button = "Manage Gmail connection"
-            else:
-                st.info("Gmail is not connected")
-                st.caption("Connect Gmail in Integrations, then add report recipients here.")
-                gmail_button = "Connect Gmail"
-            if st.button(gmail_button, key="tasks_gmail_integration", use_container_width=True):
-                navigate_to("Integrations")
-                st.rerun()
-            st.caption("Recipient selections are saved with new tasks. Check Run history to verify each delivery.")
-        section("Create a report","Describe it in your own words or fill in the details")
-        with st.container(border=True):
-            st.markdown("**Select the report's data period**")
+        section("Create a report", "Describe the report and choose where to receive it")
+        with st.expander("Reporting period · optional"):
             new_task_period = render_report_period_picker("new_report_period")
-            st.caption("This selects the dates GA4 will analyze. It does not change the task schedule.")
+            st.caption("Select GA4 data dates, not when the task will run.")
+
+        with st.container(border=True):
+            st.markdown("**Send report via**")
+            selected_delivery = st.radio(
+                "Report destination",
+                ["none", "email", "slack"],
+                format_func=lambda kind: {
+                    "none": "Save only",
+                    "email": "Gmail",
+                    "slack": "Slack",
+                }[kind],
+                horizontal=True,
+                label_visibility="collapsed",
+                key="new_report_destination",
+            )
+            selected_target = None
+            if selected_delivery == "email":
+                gmail_account = active_connections.get("gmail")
+                if not gmail_account:
+                    st.caption("Gmail isn't connected yet.")
+                    if st.button("Connect Gmail", key="new_task_connect_gmail",
+                                 use_container_width=True):
+                        navigate_to("Integrations")
+                        st.rerun()
+                else:
+                    recipients = st.multiselect(
+                        "Send to", options=[], accept_new_options=True,
+                        max_selections=5,
+                        placeholder="Type an email and press Enter",
+                        help="Up to 5 email addresses.",
+                        key="task_gmail_recipients",
+                    )
+                    if recipients:
+                        try:
+                            selected_target = gmail_delivery_target(
+                                gmail_account["id"], recipients
+                            )
+                        except ValueError as error:
+                            st.warning(str(error))
+                    else:
+                        st.caption("Enter at least one recipient.")
+            elif selected_delivery == "slack":
+                slack_account = active_connections.get("slack")
+                if not slack_account:
+                    st.caption("Slack isn't connected yet.")
+                    if st.button("Connect Slack", key="new_task_connect_slack",
+                                 use_container_width=True):
+                        navigate_to("Integrations")
+                        st.rerun()
+                else:
+                    try:
+                        channels = load_slack_channels(
+                            usage_identity(), slack_account["id"]
+                        )
+                        if channels:
+                            by_id = {ch["id"]: ch for ch in channels}
+                            selected_channel = st.selectbox(
+                                "Send to channel", list(by_id),
+                                format_func=lambda cid: (
+                                    ("🔒 " if by_id[cid]["private"] else "#")
+                                    + by_id[cid]["name"]
+                                ),
+                                key="task_slack_channel",
+                            )
+                            if by_id[selected_channel]["member"] is False:
+                                st.caption("Invite AI Employee to this channel in Slack first.")
+                            else:
+                                selected_target = slack_delivery_target(
+                                    slack_account["id"], selected_channel
+                                )
+                            if st.button("Refresh channels", key="refresh_task_slack_channels"):
+                                load_slack_channels.clear(
+                                    usage_identity(), slack_account["id"]
+                                )
+                                st.rerun()
+                        else:
+                            st.caption("No accessible Slack channels were found.")
+                    except (RuntimeError, ValueError, KeyError, TypeError) as error:
+                        LOGGER.warning(
+                            "Slack channel lookup failed: %s", str(error)[:220]
+                        )
+                        st.warning("Couldn't load channels. Check Integrations.")
+
+            delivery_ready = selected_delivery == "none" or bool(selected_target)
+            if not delivery_ready:
+                st.caption("Choose a valid destination to save this report.")
+        st.caption("Delivery settings apply to the new report you create below.")
         with st.container(border=True):
             description=st.text_area("What would you like your AI Employee to do?",
                 placeholder="Every Monday, compare my GA4 traffic and conversions to the previous week.",
@@ -3180,27 +3197,13 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                 st.write("**Instructions:**",draft["instructions"])
                 st.write("**Repeat:**",draft["schedule_type"].title())
                 st.caption("First run: tomorrow at 9 AM (Cairo). You can edit the schedule later.")
-                ai_delivery_options = (
-                    ["none"]
-                    + (["slack"] if selected_slack_target else [])
-                    + (["email"] if selected_gmail_target else [])
-                )
-                ai_delivery = st.selectbox(
-                    "Destination", ai_delivery_options,
-                    format_func=lambda d: {
-                        "none": "Save in workspace",
-                        "slack": "Selected Slack channel",
-                        "email": "Gmail recipients",
-                    }[d], key="ai_task_delivery",
-                )
-                if st.button("Approve and save task",key="approve_ai_task",use_container_width=True):
+                if st.button("Approve and save task", key="approve_ai_task",
+                             use_container_width=True, disabled=not delivery_ready):
                     tomorrow=datetime.now(CAIRO).date()+timedelta(days=1)
                     try:
                         save_planned_task(draft["title"],draft["instructions"],draft["schedule_type"],
                             tomorrow,datetime.now(CAIRO).replace(hour=9,minute=0,second=0,microsecond=0).time(),
-                            ai_delivery,
-                            (selected_slack_target if ai_delivery=="slack" else
-                             selected_gmail_target if ai_delivery=="email" else None),
+                            selected_delivery, selected_target,
                             report_period=new_task_period)
                         st.session_state.pop("agent_task_draft",None)
                         st.success("Task saved to your workspace.")
@@ -3219,30 +3222,18 @@ def render_tasks(task_rows=None, task_runs=None, usage_rows=None, tasks_error=No
                     planned_date=st.date_input("First date",value=datetime.now(CAIRO).date()+timedelta(days=1))
                 with time_col:
                     planned_time=st.time_input("Time (Cairo)",value=datetime.now(CAIRO).replace(hour=9,minute=0,second=0,microsecond=0).time())
-                delivery_options = (
-                    ["none"]
-                    + (["slack"] if selected_slack_target else [])
-                    + (["email"] if selected_gmail_target else [])
-                )
-                delivery=st.selectbox("Delivery",delivery_options,
-                    format_func=lambda x:{
-                        "none":"Save in workspace",
-                        "email":"Gmail recipients",
-                        "slack":"Selected Slack channel",
-                    }[x])
-                destination = (
-                    selected_gmail_target if delivery=="email" else
-                    selected_slack_target if delivery=="slack" else None
-                )
-                submit=st.form_submit_button("Save task plan",type="primary",use_container_width=True)
+                submit=st.form_submit_button("Save task plan",type="primary",
+                                             use_container_width=True,
+                                             disabled=not delivery_ready)
             if submit:
                 try:
                     save_planned_task(title,instructions,schedule,planned_date,planned_time,
-                                      delivery,destination,report_period=new_task_period)
+                                      selected_delivery,selected_target,
+                                      report_period=new_task_period)
                     st.rerun()
                 except ValueError as error:st.warning(str(error))
                 except RuntimeError:st.error("Couldn't save your task right now.")
-            st.caption("Tasks are saved as drafts until activated. Check Run history to confirm delivery after a report runs.")
+            st.caption("Saved as a draft. Delivery is attempted after the report succeeds.")
 
 
 def render_usage(rows, usage_error=None, credit_status=None, credit_error=None):
