@@ -459,7 +459,7 @@ function parseDelivery(type:string, raw:unknown):Json {
   if(!Array.isArray(rawRecipients)||rawRecipients.length<1||rawRecipients.length>5)
     throw new WorkerError("Choose 1 to 5 Gmail recipients.");
   const recipients=rawRecipients.map(nonempty);
-  const emailPattern=/^[^\\s@,;]+@[^\\s@,;]+\\.[^\\s@,;]+$/;
+  const emailPattern=/^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/;
   if(recipients.some(x=>x.length>254 || !emailPattern.test(x)) ||
      new Set(recipients.map(x=>x.toLowerCase())).size!==recipients.length)
     throw new WorkerError("Recipient email list is invalid.");
@@ -508,7 +508,7 @@ async function sendApprovedReport(
   }else{
     if(!("channel" in fields)||!("text" in fields))
       throw new WorkerError("Slack send action schema is not supported.");
-    args={channel:destination.channelId,text:"*"+subject+"*\\n\\n"+body};
+    args={channel:destination.channelId,text:"*"+subject+"*\n\n"+body};
   }
 
   const result=await composio(
@@ -518,7 +518,7 @@ async function sendApprovedReport(
   assertToolSucceeded(result);
 }
 
-async function deliverCompletedRun(db:Db, runId:string):Promise<string>{
+async function deliverCompletedRun(db:Db, runId:string, retryFailed=false):Promise<string>{
   const {data:run,error:runError}=await db.from("task_runs")
     .select("id,task_id,user_id,status,delivery_status,result")
     .eq("id",runId).maybeSingle();
@@ -536,7 +536,7 @@ async function deliverCompletedRun(db:Db, runId:string):Promise<string>{
   const {data:claim,error:claimError}=await db.from("task_runs")
     .update({delivery_status:"sending"})
     .eq("id",runId).eq("status","success")
-    .eq("delivery_status","not_requested")
+        .eq("delivery_status",retryFailed?"failed":"not_requested")
     .select("id").maybeSingle();
   if(claimError)throw new WorkerError("Could not reserve report delivery.",true);
   if(!claim)return "already_claimed";
@@ -674,6 +674,21 @@ export default {
       catch(error){
         console.error("Worker could not claim a task",safeError(error));
         return Response.json({status:"worker_error",message:safeError(error)},{status:503});
+      }
+    }
+    if(action==="retry_delivery"){
+      // Only internal server callers may request this action. No AI call occurs.
+      // Client requests must be ownership-checked against RLS before invoking.
+      if(!payload.run_id){
+        return Response.json({status:"invalid_request",message:"A completed report run is required."},{status:400});
+      }
+      try{
+        const runId=verifyUuid(payload.run_id);
+        const status=await deliverCompletedRun(ctx.supabaseAdmin,runId,true);
+        return Response.json({status,run_id:runId});
+      }catch(error){
+        console.error("Delivery retry failed",safeError(error));
+        return Response.json({status:"delivery_error",message:safeError(error)},{status:503});
       }
     }
     if(action==="tick"){
