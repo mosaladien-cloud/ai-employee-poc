@@ -1,3 +1,5 @@
+# RELEASE_BUILD: AI_EMPLOYEE_UI_V3_2026_11_07_VERIFIED
+# Includes Quick Actions, enhanced Overview, fixed logos, and OAuth popup.
 import json
 import time
 import html
@@ -159,7 +161,7 @@ def clear_user_workspace():
         "active_ga4_property", "messages", "authenticated_user",
         "verified_user_id", "active_google_analytics",
         "active_hubspot", "load_ga4", "auth_notice",
-        "nav_page", "manage_toolkit",
+        "nav_page", "manage_toolkit", "pending_connection_since",
     )
     for key in keys:
         st.session_state.pop(key, None)
@@ -266,7 +268,7 @@ def render_login():
     # Login screen uses the same visual language as the app.
     st.sidebar.markdown(
         '<div class="brand-lockup"><span class="brand-symbol">✦</span>'
-        '<span><strong>AI Employee</strong><small>Private beta</small></span></div>',
+        '<span><strong>AI Employee</strong><small>Early access</small></span></div>',
         unsafe_allow_html=True,
     )
     st.sidebar.markdown(
@@ -354,7 +356,7 @@ def render_login():
                         except RuntimeError as error:
                             st.error(str(error))
         st.caption(
-            "Private beta · Email confirmation may be required. "
+            "Early access · Email confirmation may be required. "
             "Sign in manually after confirming your email."
         )
 
@@ -409,7 +411,7 @@ def create_connect_link(auth_config_id):
         body={
             "user_id": composio_user_id(),
             "auth_config_id": auth_config_id,
-            "callback_url": APP_URL,
+            "callback_url": APP_URL + "/?oauth_return=1",
         },
     )
 
@@ -1107,6 +1109,49 @@ p {color:#53637a;}
 [data-testid="stChatMessage"]{border:1px solid #e8ecf3;border-radius:13px;background:white;margin-bottom:9px;padding:8px 10px;}
 [data-testid="stChatInput"]{border-radius:12px;}
 [data-testid="stMetric"]{background:white;border:1px solid #e7ebf2;border-radius:13px;padding:16px;}
+/* CTA styling: the text elements in Streamlit buttons require explicit color. */
+[data-testid="stButton"] button[kind="primary"],
+[data-testid="stFormSubmitButton"] button[kind="primary"],
+[data-testid="stButton"] button[data-testid="baseButton-primary"],
+[data-testid="stFormSubmitButton"] button[data-testid="baseButton-primary"] {
+  color:#fff!important;-webkit-text-fill-color:#fff!important;
+  background:#4f46e5!important;border-color:#4f46e5!important;
+}
+[data-testid="stButton"] button[kind="primary"] *,
+[data-testid="stFormSubmitButton"] button[kind="primary"] *,
+[data-testid="stButton"] button[data-testid="baseButton-primary"] *,
+[data-testid="stFormSubmitButton"] button[data-testid="baseButton-primary"] * {
+  color:#fff!important;-webkit-text-fill-color:#fff!important;
+}
+[data-testid="stButton"] button[kind="primary"]:hover,
+[data-testid="stFormSubmitButton"] button[kind="primary"]:hover,
+[data-testid="stButton"] button[data-testid="baseButton-primary"]:hover,
+[data-testid="stFormSubmitButton"] button[data-testid="baseButton-primary"]:hover {
+  background:#4338ca!important;border-color:#4338ca!important;
+}
+/* Native Streamlit quick actions are real buttons, not HTML mock controls. */
+.quick-actions-title{font-size:12px;color:#7c8ba2;font-weight:750;letter-spacing:.02em;margin:12px 0 9px;}
+.onboarding-shell{border:1px solid #e3e9f6;background:#fff;border-radius:17px;padding:22px 23px;margin:14px 0 8px;}
+.onboarding-heading{font-size:16px;color:#1e2d46;font-weight:800;margin-bottom:7px;}
+.onboarding-intro{font-size:12px;color:#7f8da4;line-height:1.7;}
+.journey-step{border:1px solid #e6ebf3;background:#fff;border-radius:13px;padding:15px 16px;min-height:117px;margin-bottom:7px;}
+.journey-step.done{background:#f4faf7;border-color:#d8f1e2;}
+.journey-step.current{background:#f4f5ff;border-color:#dcdcff;}
+.journey-number{font-size:11px;font-weight:800;color:#6a62dc;margin-bottom:9px;}
+.journey-title{font-size:13px;font-weight:750;color:#273650;margin-bottom:7px;}
+.journey-desc{font-size:11px;line-height:1.6;color:#7a899e;}
+.dashboard-panel{border:1px solid #e6eaf2;background:#fff;border-radius:15px;padding:20px;margin-bottom:14px;min-height:195px;}
+.dashboard-panel-head{font-weight:800;color:#25334b;font-size:14px;margin:0 0 9px;}
+.dashboard-panel-muted{font-size:12px;color:#8593a8;line-height:1.8;}
+.activity-item{display:flex;align-items:center;gap:10px;border-top:1px solid #eef1f6;padding:12px 0;}
+.activity-mark{background:#eeeefe;color:#615cde;border-radius:10px;width:29px;height:29px;display:grid;place-items:center;font-size:13px;flex-shrink:0;}
+.activity-copy{font-size:12px;font-weight:650;color:#334359;line-height:1.6;}
+.activity-sub{font-size:11px;color:#929eb0;line-height:1.6;}
+.svg-logo{width:27px;height:27px;display:block;}
+.svg-logo svg{width:100%;height:100%;display:block;}
+.oauth-launch-link{display:block;text-align:center;padding:12px 14px;border-radius:9px;background:#4f46e5;color:white!important;text-decoration:none!important;font-weight:750;font-family:'DM Sans',sans-serif;font-size:13px;min-height:42px;}
+.oauth-launch-link:hover{background:#4338ca;color:#fff!important;}
+
 @media (max-width:900px){.block-container{padding-left:1rem;padding-right:1rem;padding-top:1.3rem;}.page-title{font-size:26px;}.hero-card{padding:22px;}}
 </style>
 """
@@ -1139,9 +1184,55 @@ LOGOS = {
 }
 
 
+# Locally rendered vector marks avoid the broken CDN URLs for these brands.
+# They are recognizable brand-style icons, not official brand artwork assets.
+INLINE_LOGOS = {
+    "microsoft": (
+        '<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">'
+        '<rect x="1" y="1" width="14" height="14" fill="#f25022"/>'
+        '<rect x="17" y="1" width="14" height="14" fill="#7fba00"/>'
+        '<rect x="1" y="17" width="14" height="14" fill="#00a4ef"/>'
+        '<rect x="17" y="17" width="14" height="14" fill="#ffb900"/>'
+        '</svg>'
+    ),
+    "linkedin": (
+        '<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">'
+        '<rect width="32" height="32" rx="5" fill="#0A66C2"/>'
+        '<circle cx="7.9" cy="9" r="2.2" fill="white"/>'
+        '<rect x="5.8" y="13" width="4.3" height="13" fill="white"/>'
+        '<path d="M13 13h4.1v1.8c.9-1.4 2.2-2.1 4.1-2.1 4 0 5.5 2.6 5.5 6.4V26h-4.4v-6.2c0-1.7-.4-2.9-2.2-2.9-1.7 0-2.6 1.2-2.6 2.9V26H13z" fill="white"/>'
+        '</svg>'
+    ),
+    "klaviyo": (
+        '<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">'
+        '<rect width="32" height="32" rx="6" fill="#222222"/>'
+        '<path d="M8 6h4v8l8-8h5l-9.5 9.3L26 26h-5.5L12 17.5V26H8z" fill="#ffffff"/>'
+        '</svg>'
+    ),
+    "slack": (
+        '<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">'
+        '<rect x="4" y="12" width="5" height="11" rx="2.5" fill="#36C5F0"/>'
+        '<rect x="4" y="4" width="5" height="5" rx="2.5" fill="#36C5F0"/>'
+        '<rect x="11" y="4" width="5" height="12" rx="2.5" fill="#2EB67D"/>'
+        '<rect x="19" y="4" width="5" height="12" rx="2.5" fill="#ECB22E" transform="rotate(90 21.5 10)"/>'
+        '<rect x="17" y="12" width="11" height="5" rx="2.5" fill="#E01E5A"/>'
+        '<rect x="23" y="18" width="5" height="10" rx="2.5" fill="#E01E5A"/>'
+        '<rect x="16" y="18" width="5" height="10" rx="2.5" fill="#2EB67D"/>'
+        '<rect x="4" y="23" width="13" height="5" rx="2.5" fill="#ECB22E"/>'
+        '</svg>'
+    ),
+}
+
+
 def logo_url(slug):
-    # Simple Icons CDN: public brand icons, not a new Python dependency.
     return f"https://cdn.simpleicons.org/{quote(slug, safe='')}"
+
+
+def logo_markup(slug, name):
+    if slug in INLINE_LOGOS:
+        return '<span class="svg-logo" role="img" aria-label="' + safe_html(name) + '">' + INLINE_LOGOS[slug] + '</span>'
+    # Remaining connectors keep their working CDN source.
+    return f'<img src="{safe_html(logo_url(slug))}" alt="{safe_html(name)} logo" loading="lazy">'
 
 
 def safe_html(value):
@@ -1161,7 +1252,7 @@ def section(title, subtitle=None):
         )
 
 
-def page_header(title, description, tag="PRIVATE BETA"):
+def page_header(title, description, tag="YOUR WORKSPACE"):
     st.markdown(
         '<div class="page-top"><div>'
         '<div class="eyebrow">AI EMPLOYEE WORKSPACE</div>'
@@ -1206,7 +1297,7 @@ def integration_intro(name, logo, description, connected):
     st.markdown(
         '<div class="integration-head">'
         '<div class="integration-logo">'
-        f'<img src="{safe_html(logo_url(logo))}" alt="{safe_html(name)} logo">'
+        + logo_markup(logo, name) +
         '</div><div>'
         f'<div class="integration-name">{safe_html(name)}</div>'
         f'<div class="integration-desc">{safe_html(description)}</div>'
@@ -1268,9 +1359,8 @@ def render_sidebar(user, current_connections):
         st.divider()
         st.markdown(
             '<div class="sidebar-note">'
-            '<strong style="color:white">Private beta</strong><br>'
-            'Connect sources and analyze live data. Tasks and usage tracking '
-            'are being added next.</div>',
+            '<strong style="color:white">Early access</strong><br>'
+            'Your workspace for connected analytics, reports and upcoming automations.</div>',
             unsafe_allow_html=True,
         )
         st.markdown(
@@ -1297,60 +1387,201 @@ def render_sidebar(user, current_connections):
 
 
 def render_overview(user, active_connections, connection_errors):
+    """Action-first overview: only authentic and account-scoped information."""
+    first = (user.get("email") or "there").split("@")[0].replace(".", " ").title()
     page_header(
         "Overview",
-        "One place to manage your data connections, AI analysis and upcoming automations.",
-        tag="WORKSPACE OVERVIEW",
+        "Everything you need to work with your AI Employee, in one place.",
+        tag="YOUR WORKSPACE",
     )
-    first = (user.get("email") or "there").split("@")[0]
+    ready_count = len(active_connections)
+    approved = st.session_state.get("approved_ga4_properties", [])
+    has_chat = bool(st.session_state.get("messages"))
+    user_ready = bool(ready_count and ("hubspot" in active_connections or approved))
+    status_text = "Ready to analyze" if user_ready else "Ready to connect"
     st.markdown(
         '<div class="hero-card">'
-        '<div class="hero-kicker">YOUR DIGITAL ANALYST</div>'
+        '<div class="hero-kicker">✦ YOUR AI EMPLOYEE · ' + safe_html(status_text.upper()) + '</div>'
         f'<h2>Welcome back, {safe_html(first)}.</h2>'
-        '<p>Your AI Employee is ready to answer questions about connected business data. '
-        'More capabilities — scheduled tasks, deliveries, and tracked usage — '
-        'will appear here as we enable them.</p></div>',
-        unsafe_allow_html=True,
+        '<p>What would you like to accomplish today? Get answers from your data, '
+        'connect a source, or manage upcoming work — all from this workspace.</p>'
+        '</div>', unsafe_allow_html=True,
     )
+    st.markdown('<div class="quick-actions-title">QUICK ACTIONS</div>', unsafe_allow_html=True)
+    qa1, qa2, qa3, qa4 = st.columns([1, 1, 1, 1], gap="medium")
+    with qa1:
+        st.button("✦  Ask AI", type="primary", use_container_width=True,
+                  key="overview_ask", on_click=navigate_to, args=("AI Chat",))
+    with qa2:
+        st.button("⛓  Connect Data", use_container_width=True,
+                  key="overview_connect", on_click=navigate_to, args=("Integrations",))
+    with qa3:
+        st.button("☑  My Tasks", use_container_width=True,
+                  key="overview_tasks", on_click=navigate_to, args=("My Tasks",))
+    with qa4:
+        st.button("◫  View Usage", use_container_width=True,
+                  key="overview_usage", on_click=navigate_to, args=("Usage",))
+
+    st.markdown('<div style="height:12px"></div>', unsafe_allow_html=True)
     a, b, c, d = st.columns(4, gap="medium")
     with a:
-        metric_card("Connected sources", len(active_connections), "Live Composio connections")
+        metric_card("Connected sources", ready_count, "Active in your workspace")
     with b:
-        metric_card("Available integrations", len(APPS), "Ready for connection")
+        metric_card("Available integrations", len(APPS), "Sources you can connect")
     with c:
-        metric_card("Scheduled tasks", "—", "Not enabled yet")
+        metric_card("Scheduled tasks", "—", "Scheduling coming soon")
     with d:
-        metric_card("AI usage", "—", "Tracking coming next")
+        metric_card("AI credits", "—", "Usage tracking coming soon")
 
-    left, right = st.columns([1.55, 1], gap="large")
+    if not user_ready:
+        section("Get started", "Three steps to your first insight")
+        p1, p2, p3 = st.columns(3, gap="medium")
+        steps = [
+            ("01", "Connect a data source", "Authorize Google Analytics or HubSpot.", ready_count > 0, ready_count == 0),
+            ("02", "Choose what to analyze", "Select your GA4 property, if needed.", user_ready, ready_count > 0 and not user_ready),
+            ("03", "Ask your first question", "Use AI Chat for real answers from your account.", has_chat and user_ready, user_ready),
+        ]
+        for column, (number, title, detail, done, current) in zip((p1, p2, p3), steps):
+            with column:
+                css = 'done' if done else ('current' if current else '')
+                st.markdown(
+                    f'<div class="journey-step {css}">'
+                    f'<div class="journey-number">{number}  {"✓ COMPLETE" if done else ("CURRENT STEP" if current else "UP NEXT")}</div>'
+                    f'<div class="journey-title">{safe_html(title)}</div>'
+                    f'<div class="journey-desc">{safe_html(detail)}</div>'
+                    '</div>', unsafe_allow_html=True,
+                )
+        st.button("Continue setup →", key="overview_setup", use_container_width=False,
+                  on_click=navigate_to, args=("Integrations",))
+
+    section("At a glance", "Your workspace, recent activity and next steps")
+    left, right = st.columns([1, 1], gap="medium")
     with left:
-        section("Your workspace", "What is available today")
-        with st.container(border=True):
-            st.markdown("**✧ AI Analyst**")
-            st.caption("Ask questions about the selected GA4 property or connected CRM data.")
-            st.markdown("**⛓ Connected data sources**")
-            if active_connections:
-                for name, config in APPS.items():
-                    if config["toolkit"] in active_connections:
-                        st.markdown(f"• {name}  ·  Connected")
-            else:
-                st.info("Connect Google Analytics or HubSpot to get started.")
-            st.markdown("**☑ Tasks & scheduled reports**")
-            st.caption("Interface prepared; task execution is not enabled yet.")
+        st.markdown('<div class="dashboard-panel">'
+                    '<div class="dashboard-panel-head">◷ Upcoming tasks</div>'
+                    '<div class="dashboard-panel-muted">No scheduled tasks yet. '
+                    'Once scheduling is enabled, your next reports and their delivery times will appear here.</div>'
+                    '<div style="margin-top:18px"><span class="status-pill status-violet">Planned feature</span></div>'
+                    '</div>', unsafe_allow_html=True)
     with right:
-        section("System status", "Live account-level status")
-        with st.container(border=True):
-            st.markdown("**Authentication**")
-            st.success("Supabase login active")
-            st.markdown("**AI model**")
-            st.caption(GEMINI_MODEL)
-            st.markdown("**Integrations**")
-            if connection_errors:
-                st.warning("Connection status couldn't be checked for every service.")
-            elif active_connections:
-                st.success(f"{len(active_connections)} connected source(s)")
-            else:
-                st.info("No sources connected yet")
+        recent = [m for m in st.session_state.get("messages", []) if m.get("role") == "user"][-3:]
+        lines = ''
+        for item in reversed(recent):
+            short = item.get("content", "").replace("\n", " ").strip()[:110]
+            lines += (
+                '<div class="activity-item"><span class="activity-mark">✧</span>'
+                '<div><div class="activity-copy">' + safe_html(short) + '</div>'
+                '<div class="activity-sub">AI Chat · This browser session</div></div></div>'
+            )
+        if not lines:
+            lines = ('<div class="dashboard-panel-muted">Your recent questions will appear here '
+                     'once you start chatting with your AI Employee.</div>')
+        st.markdown('<div class="dashboard-panel"><div class="dashboard-panel-head">↻ Recent activity</div>'
+                    + lines + '</div>', unsafe_allow_html=True)
+
+    section("Your connected workspace", "See what your AI Employee can work with")
+    with st.container(border=True):
+        if connection_errors:
+            st.warning("Some connection statuses couldn't be checked. Please try again.")
+        if active_connections:
+            st.success(f"{ready_count} data source(s) connected")
+            for name, config in APPS.items():
+                if config["toolkit"] in active_connections:
+                    st.markdown(f"**✓ {name}** · Connected")
+            if "google_analytics" in active_connections and not approved:
+                st.info("To analyze Google Analytics data, open Integrations and choose a property.")
+                st.button("Select GA4 property →", key="overview_ga4", on_click=navigate_to,
+                          args=("Integrations",))
+        else:
+            st.info("Connect Google Analytics or HubSpot to start using your own data.")
+            st.button("Browse integrations →", key="overview_browse", on_click=navigate_to,
+                      args=("Integrations",))
+
+
+def navigate_to(page):
+    """Only real native Streamlit buttons may change this navigation state."""
+    if page in ("Overview", "AI Chat", "My Tasks", "Integrations", "Usage", "Settings"):
+        st.session_state["nav_page"] = page
+
+
+def render_oauth_popup_link(url, toolkit):
+    """Open the provider in a small popup without destroying the main session.
+
+    In browsers that block popups, the fallback is a normal new tab. Do NOT
+    put Supabase JWT or refresh tokens in a URL to survive a same-tab redirect.
+    """
+    element_id = "oauth_start_" + toolkit
+    markup = f"""
+    <a class="oauth-launch-link" id="{safe_html(element_id)}"
+       href="{safe_html(url)}" target="ai_employee_authorization"
+       style="display:block;background:#4f46e5;color:#fff;text-align:center;"
+    >Continue to authorization ↗</a>
+    <script>
+      (function() {{
+        var link = document.getElementById({json.dumps(element_id)});
+        if (!link) return;
+        link.addEventListener('click', function(event) {{
+          var popup = window.open(link.href, 'ai_employee_authorization',
+            'popup=yes,width=600,height=750,left=180,top=70,scrollbars=yes,resizable=yes');
+          if (popup) {{ event.preventDefault(); popup.focus(); }}
+        }});
+      }})();
+    </script>
+    """
+    try:
+        # In recent Streamlit releases, scripts can run only if explicitly opted in.
+        st.html(markup, unsafe_allow_javascript=True)
+    except (TypeError, AttributeError):
+        # Older Streamlit deployments don't support JS in st.html.
+        st.link_button("Continue to authorization ↗", url, use_container_width=True)
+
+
+@st.fragment(run_every="5s")
+def monitor_oauth_connection(toolkit):
+    """Refresh active connection state while OAuth popup is in progress."""
+    if toolkit not in st.session_state.get("connect_links", {}):
+        return
+    started = st.session_state.get("pending_connection_since", {}).get(toolkit, 0)
+    if started and time.time() - started > 180:
+        st.caption("If authorization is complete, use Refresh below. A new link may be needed if it expired.")
+        return
+    try:
+        accounts = get_connections(toolkit)
+        if accounts:
+            st.session_state["connect_links"].pop(toolkit, None)
+            st.session_state.get("pending_connection_since", {}).pop(toolkit, None)
+            st.session_state["manage_toolkit"] = toolkit
+            st.rerun()
+        st.caption("Waiting for authorization… This card will update automatically.")
+    except RuntimeError:
+        st.caption("Can't check the connection right now. Try Refresh status.")
+
+
+def render_oauth_return():
+    """Complete the popup UI before auth gate; no tokens are stored here.
+
+    The *original* app session is still live in its browser tab; only it
+    checks Composio ownership. Query params alone never prove a connection.
+    """
+    status = str(st.query_params.get("status", ""))
+    if status == "failed":
+        st.error("Authorization wasn't completed. Close this window and try again.")
+        st.stop()
+    st.markdown("## Connection step finished")
+    st.caption("Returning to your AI Employee workspace. This window should close automatically.")
+    try:
+        st.html("""
+        <script>
+        if (window.opener && window.opener !== window) {
+          window.opener.postMessage({type:'ai_employee_authorization_returned'}, window.location.origin);
+          window.close();
+        }
+        </script>
+        """, unsafe_allow_javascript=True)
+    except (TypeError, AttributeError):
+        pass
+    st.info("If this window stays open, close it and return to the original AI Employee tab.")
+    st.stop()
 
 
 def render_live_integration(name, config, accounts, error):
@@ -1379,14 +1610,14 @@ def render_live_integration(name, config, accounts, error):
                 try:
                     link = create_connect_link(st.secrets[config["secret"]])
                     st.session_state.setdefault("connect_links", {})[toolkit] = link
+                    st.session_state.setdefault("pending_connection_since", {})[toolkit] = time.time()
                 except (RuntimeError, KeyError) as err:
                     st.error(str(err))
             link = st.session_state.get("connect_links", {}).get(toolkit)
             if link:
-                st.link_button(
-                    "Authorize account ↗", link, use_container_width=True
-                )
-                if st.button("Refresh status", key=f"refresh_{toolkit}", use_container_width=True):
+                render_oauth_popup_link(link, toolkit)
+                monitor_oauth_connection(toolkit)
+                if st.button("Refresh connection", key=f"refresh_{toolkit}", use_container_width=True):
                     st.rerun()
 
 
@@ -1408,7 +1639,6 @@ def render_connection_manager(toolkit, accounts, active_connections):
             account = accounts[0]
         active_connections[toolkit] = account
         st.success(f"Connected · {len(accounts)} account(s)")
-        st.caption("Connection ID: " + safe_html(account["id"]))
         if toolkit == "google_analytics":
             previous = st.session_state.get("ga4_property_connection")
             if previous and previous != account["id"]:
@@ -1513,7 +1743,7 @@ def render_integrations(accounts_by_toolkit, active_connections, errors):
             st.markdown(
                 '<div class="soon-card"><div class="soon-top">'
                 '<div class="soon-logo">'
-                f'<img src="{safe_html(logo_url(slug))}" alt="{safe_html(name)} logo">'
+                + logo_markup(slug, name) +
                 '</div>'
                 f'<div class="soon-name">{safe_html(name)}</div>'
                 '</div><span class="status-pill status-violet">Planned</span></div>',
@@ -1537,7 +1767,7 @@ def render_ai_chat(active_connections):
     with left:
         with st.container(border=True):
             st.markdown("**✧ Your AI Analyst**")
-            st.caption("Connected-data answers, backed by approved read-only tools")
+            st.caption("Real answers from the data sources you choose")
             if not active_connections:
                 st.info("No data sources connected. Go to Integrations to connect GA4 or HubSpot.")
             if "messages" not in st.session_state:
@@ -1560,10 +1790,8 @@ def render_ai_chat(active_connections):
                                 conversation, active_connections, active_property,
                             )
                             st.markdown(answer)
-                            if tools_used:
-                                with st.expander("Tools used"):
-                                    for tool in tools_used:
-                                        st.code(tool)
+                            # Tool diagnostics are intentionally omitted from the customer UI.
+                            # Read-only tools are still enforced server-side.
                             st.session_state.messages.extend([
                                 {"role": "user", "content": prompt},
                                 {"role": "assistant", "content": answer},
@@ -1584,8 +1812,8 @@ def render_ai_chat(active_connections):
             elif "google_analytics" in active_connections:
                 st.warning("Select a GA4 property in Integrations first")
             st.divider()
-            st.markdown("**AI Safety**")
-            st.caption("Read-only analysis. No write or delete tools enabled.")
+            st.markdown("**Your data stays in your control**")
+            st.caption("Your AI Employee currently uses read-only access to connected sources.")
         section("Try asking")
         st.markdown(
             "- How many sessions did we get last week?\n"
@@ -1625,24 +1853,24 @@ def render_usage():
 
 
 def render_settings(user):
-    page_header("Settings", "Manage your workspace preferences and account.", tag="PRIVATE BETA")
+    page_header("Settings", "Manage your workspace preferences and account.", tag="YOUR WORKSPACE")
     left,right = st.columns([1.4,1],gap="large")
     with left:
         section("Account details")
         with st.container(border=True):
             st.markdown("**Signed-in email**")
             st.code(user.get("email") or "Unavailable")
-            st.markdown("**Authentication**")
-            st.caption("Supabase Auth — verified user session")
+            st.markdown("**Account security**")
+            st.success("Your session is protected")
             st.markdown("**Default timezone**")
             st.caption("Africa/Cairo · Scheduled-task timezone will be configurable later")
     with right:
         section("AI configuration")
         with st.container(border=True):
-            st.markdown("**Model**")
-            st.caption(GEMINI_MODEL)
-            st.markdown("**Tool permission**")
-            st.success("Read-only tools")
+            st.markdown("**AI Employee**")
+            st.success("Ready for data analysis")
+            st.markdown("**Source permissions**")
+            st.caption("Read-only access to connected data")
             st.caption("Custom AI instructions and task-delivery preferences are planned.")
 
 
@@ -1651,6 +1879,8 @@ def render_settings(user):
 # ==========================================
 
 inject_theme()
+if st.query_params.get("oauth_return") == "1":
+    render_oauth_return()
 user = get_signed_in_user()
 if not user:
     render_login()
