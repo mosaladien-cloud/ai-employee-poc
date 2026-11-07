@@ -1,10 +1,10 @@
-// AI Employee V7.4 - Flexible GA4 date ranges, unrestricted history windows + delivery
+// AI Employee V7.4.1 - User-selected GA4 reporting periods + Gmail/Slack delivery
 // One run per invocation; no schedules are created by this file.
 // Auth: Supabase secret key on apikey (verify_jwt disabled for this function).
 // Uses the existing V6 credit reservation, metering and settlement functions.
 import { withSupabase } from "npm:@supabase/server@1";
 
-const WORKER_VERSION = "7.4.0";
+const WORKER_VERSION = "7.4.1";
 const MODEL = "gemini-3.5-flash-lite";
 const MODEL_PRICING = "gemini-3.5-flash-lite-standard-2026-11-07";
 const COMPOSIO_BASE = "https://backend.composio.dev/api/v3.1";
@@ -214,6 +214,45 @@ function subtractMonthsCairo(wholeMonths:number,now:Date=new Date()):string {
     monthStart.getUTCMonth()+1,0)).getUTCDate();
   monthStart.setUTCDate(Math.min(today.getUTCDate(),lastDay));
   return monthStart.toISOString().slice(0,10);
+}
+
+// A report date selection from My Tasks is stored alongside the existing
+// task instructions. It takes priority over natural-language date inference.
+// This preserves the current database schema and avoids asking the model to
+// decide dates that a customer has already selected explicitly.
+function extractSavedPeriod(raw:string):{
+  instructions:string,selectedPeriod?:ReportPeriod
+}{
+  const directive=/\n\n\[\[AI_EMPLOYEE_PERIOD_V1\]\](\{[^\r\n]{1,250}\})\[\[\/AI_EMPLOYEE_PERIOD_V1\]\]$/;
+  const match=raw.match(directive);
+  if(!match)return {instructions:raw};
+  const instructions=raw.slice(0,match.index).trim();
+  if(!instructions)throw new WorkerError("Report instructions cannot be empty.");
+  let config:Json;
+  try{config=asObject(JSON.parse(match[1]));}
+  catch{throw new WorkerError("Saved reporting period could not be read.");}
+  if(config.mode==="rolling_days"){
+    const days=config.days;
+    if(!Number.isSafeInteger(days)||typeof days!=="number"||days<1||days>99_999_999){
+      throw new WorkerError("Choose a valid number of reporting days.");
+    }
+    return {instructions,selectedPeriod:{
+      startDate:days+"daysAgo",endDate:"yesterday",
+      label:"The last "+days+" completed days in the analytics property's time zone",
+    }};
+  }
+  if(config.mode==="fixed"){
+    const startDate=config.start;
+    const endDate=config.end;
+    if(!isValidIsoDate(startDate)||!isValidIsoDate(endDate)||
+       startDate>endDate||dateSortKey(endDate)>dateSortKey("today")){
+      throw new WorkerError("The selected reporting dates are invalid.");
+    }
+    return {instructions,selectedPeriod:{
+      startDate,endDate,label:"Selected dates "+startDate+" through "+endDate+", inclusive",
+    }};
+  }
+  throw new WorkerError("Unrecognized reporting period selection.");
 }
 
 function resolveReportPeriod(instructions:string):ReportPeriod|undefined {
@@ -476,8 +515,11 @@ async function executeTask(
 ):Promise<{result:Json, estimatedCost:number}> {
   const runId=verifyUuid(job.run_id);
   const userId=verifyUuid(job.user_id);
-  const instructions=nonempty(job.instructions);
-  if(!instructions || instructions.length>8000)throw new WorkerError("Task instructions are missing or too long.");
+  const rawInstructions=nonempty(job.instructions);
+  if(!rawInstructions || rawInstructions.length>8000)
+    throw new WorkerError("Task instructions are missing or too long.");
+  const selected=extractSavedPeriod(rawInstructions);
+  const instructions=selected.instructions;
   // This initial worker is deliberately GA4-only: do not silently substitute
   // GA4 data for a task that explicitly requires another platform.
   const sources=job.data_sources;
@@ -489,7 +531,7 @@ async function executeTask(
   const sessionId=await createSession(userId,accountId);
   const tools=await getToolDefinitions();
   const requestId=crypto.randomUUID();
-  const requiredPeriod=resolveReportPeriod(instructions);
+  const requiredPeriod=selected.selectedPeriod ?? resolveReportPeriod(instructions);
   const reportingWindow=requiredPeriod
     ?`MANDATORY reporting period: ${requiredPeriod.label}. For the GA4 query, use startDate=${requiredPeriod.startDate} and endDate=${requiredPeriod.endDate}, inclusive, interpreted in the GA4 property's time zone for relative dates. Do not shorten or replace this period.`
     :`Respect the client's requested reporting period precisely. The GA4 API accepts exact YYYY-MM-DD dates, today, yesterday, and NdaysAgo (such as 365daysAgo). Do not impose an arbitrary lookback limit.`;
@@ -768,8 +810,10 @@ export default {
           {"x-goog-api-key":mustEnvironment("GOOGLE_API_KEY")}),
         probe(COMPOSIO_BASE+"/connected_accounts?limit=1",composioHeaders()),
       ]);
+      const scheduleCheck=await ctx.supabaseAdmin.rpc("v7_scheduler_ready",{});
+      const schedulingEnabled=!scheduleCheck.error&&scheduleCheck.data===true;
       return Response.json({worker:"ai-task-worker",version:WORKER_VERSION,status:gemini.connected&&composioCheck.connected?"connectivity_ready":"connection_failed",
-        gemini,composio:composioCheck,task_execution_enabled:true,scheduling_enabled:false});
+        gemini,composio:composioCheck,task_execution_enabled:true,scheduling_enabled:schedulingEnabled});
     }
     if(action==="preflight"){
       const db=ctx.supabaseAdmin;
