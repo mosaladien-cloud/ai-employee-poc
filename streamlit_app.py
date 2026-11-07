@@ -1,6 +1,7 @@
-# RELEASE_BUILD: AI_EMPLOYEE_UI_V4_USAGE_2026_11_07_VERIFIED
+# RELEASE_BUILD: AI_EMPLOYEE_UI_V4_1_USAGE_RESILIENCE_2026_11_07
 # Gemini usage ledger, business overview, client usage charts, inline integration management.
 import json
+import logging
 import time
 import html
 import uuid
@@ -38,6 +39,7 @@ SUPABASE_SECRET_KEY = st.secrets["SUPABASE_SECRET_KEY"]
 GEMINI_PRICES = {"input": Decimal("0.30"), "output": Decimal("2.50"), "cache": Decimal("0.03")}
 PRICE_VERSION = "gemini-3.5-flash-lite-standard-2026-11-07"
 CAIRO = ZoneInfo("Africa/Cairo")
+LOGGER = logging.getLogger("ai_employee")
 
 # Separate, verified Composio identity for each Supabase user.
 # Do not reuse the old shared test identity.
@@ -172,7 +174,7 @@ def clear_user_workspace():
         "active_ga4_property", "messages", "authenticated_user",
         "verified_user_id", "active_google_analytics",
         "active_hubspot", "load_ga4", "auth_notice",
-        "nav_page", "manage_toolkit", "pending_connection_since", "pending_connection_since",
+        "nav_page", "manage_toolkit", "pending_connection_since",
     )
     for key in keys:
         st.session_state.pop(key, None)
@@ -378,20 +380,31 @@ def render_login():
 
 
 def usage_db_request(method="GET", body=None, query=None):
-    """Server-side only. Never expose or proxy the secret key to the browser.
+    """Per-user read using JWT + RLS; privileged server-side write.
 
-    Callers use the Supabase Auth verified identity, not a user-supplied ID.
-    Secret keys bypass RLS, so all SELECTs are explicitly user-filtered.
+    SELECT deliberately uses the authenticated user's token, not the secret
+    key. Supabase RLS restricts data to auth.uid() in this case. INSERT uses
+    a backend-only secret after verified user identity is established.
     """
     url = SUPABASE_URL + "/rest/v1/ai_usage"
     if query:
         url += "?" + urlencode(query)
     headers = {
-        "apikey": SUPABASE_SECRET_KEY,
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-    if method != "GET":
+    if method == "GET":
+        tokens = st.session_state.get("auth_tokens") or {}
+        access = tokens.get("access_token")
+        if not access or not st.session_state.get("verified_user_id"):
+            raise RuntimeError("Sign in again to view your usage.")
+        headers["apikey"] = SUPABASE_PUBLISHABLE_KEY
+        headers["Authorization"] = "Bearer " + access
+    else:
+        # Never send sb_secret_ keys to the user's browser or GitHub.
+        if not SUPABASE_SECRET_KEY.startswith("sb_secret_"):
+            raise RuntimeError("Backend usage key is not configured correctly.")
+        headers["apikey"] = SUPABASE_SECRET_KEY
         headers["Prefer"] = "return=minimal"
     return http_json(url, method=method, body=body, headers=headers, timeout=25)
 
@@ -1632,13 +1645,15 @@ def render_sidebar(user, current_connections):
     return page
 
 
-def render_overview(user, active_connections, connection_errors, rows):
+def render_overview(user, active_connections, connection_errors, rows, usage_error=None):
     """Executive overview: real usage metrics without duplicate navigation."""
     now, month_start, last_30 = cairo_periods()
     usage = usage_summary(rows, month_start)
     usage_30 = usage_summary(rows, last_30)
     first = (user.get("email") or "there").split("@")[0].replace("."," ").title()
     page_header("Overview", "A clear view of your AI Employee's activity.", tag="WORKSPACE")
+    if usage_error:
+        st.warning("Usage information is temporarily unavailable. Other workspace features are still accessible.")
     st.markdown(
         '<div class="hero-card"><div class="hero-kicker">YOUR AI EMPLOYEE · WORKSPACE</div>'
         f'<h2>Welcome back, {safe_html(first)}.</h2>'
@@ -1648,19 +1663,25 @@ def render_overview(user, active_connections, connection_errors, rows):
     )
     k1,k2,k3,k4 = st.columns(4, gap="medium")
     with k1: metric_card("Connected sources", len(active_connections), "Available to your workspace")
-    with k2: metric_card("AI requests", format_tokens(usage["requests"]), "This month")
-    with k3: metric_card("AI tokens", format_tokens(usage["tokens"]), "This month")
-    with k4: metric_card("Est. AI cost", format_cost(usage["cost"]), "Paid-tier equivalent · this month")
+    with k2: metric_card("AI requests", "—" if usage_error else format_tokens(usage["requests"]), "This month")
+    with k3: metric_card("AI tokens", "—" if usage_error else format_tokens(usage["tokens"]), "This month")
+    with k4: metric_card("Est. AI cost", "—" if usage_error else format_cost(usage["cost"]), "Paid-tier equivalent · this month")
     section("AI activity", "A quick look at how your assistant is being used")
     l,r = st.columns([1,1.18],gap="large")
     with l:
         with st.container(border=True):
             st.markdown("**Monthly token breakdown**")
-            usage_donut(usage)
+            if usage_error:
+                st.caption("Usage data is currently unavailable.")
+            else:
+                usage_donut(usage)
     with r:
         with st.container(border=True):
             st.markdown("**Last 30 days**")
-            usage_daily_chart(usage_30)
+            if usage_error:
+                st.caption("Chart will appear when usage data is available.")
+            else:
+                usage_daily_chart(usage_30)
     section("What's next", "Upcoming work and recent activity")
     l,r = st.columns(2, gap="large")
     with l:
@@ -1671,7 +1692,9 @@ def render_overview(user, active_connections, connection_errors, rows):
     with r:
         with st.container(border=True):
             st.markdown("**Recent AI activity**")
-            if usage_30["rows"]:
+            if usage_error:
+                st.caption("Activity history is temporarily unavailable.")
+            elif usage_30["rows"]:
                 # Show times and counts only: no prompt / business data exposed.
                 seen = set()
                 for row, timestamp in usage_30["rows"]:
@@ -2001,26 +2024,37 @@ def render_tasks():
     )
 
 
-def render_usage(rows):
+def render_usage(rows, usage_error=None):
     page_header("Usage", "Understand how your AI Employee is being used.", tag="YOUR ACTIVITY")
+    if usage_error:
+        st.warning("Usage information is temporarily unavailable. Your account and integrations are unaffected.")
     now, month_start, last_30 = cairo_periods()
     summary = usage_summary(rows, month_start)
     thirty = usage_summary(rows, last_30)
     k1,k2,k3,k4 = st.columns(4, gap="medium")
-    with k1: metric_card("AI requests", format_tokens(summary["requests"]), "This month")
-    with k2: metric_card("Model calls", format_tokens(summary["api_calls"]), "All calls, including tool turns")
-    with k3: metric_card("Total tokens", format_tokens(summary["tokens"]), "This month")
-    with k4: metric_card("Est. AI cost", format_cost(summary["cost"]), "Paid-tier equivalent")
+    with k1: metric_card("AI requests", "—" if usage_error else format_tokens(summary["requests"]), "This month")
+    with k2: metric_card("Model calls", "—" if usage_error else format_tokens(summary["api_calls"]), "All calls, including tool turns")
+    with k3: metric_card("Total tokens", "—" if usage_error else format_tokens(summary["tokens"]), "This month")
+    with k4: metric_card("Est. AI cost", "—" if usage_error else format_cost(summary["cost"]), "Paid-tier equivalent")
     section("Usage trends", "Based on your own account activity")
     left, right = st.columns([1,1.2], gap="large")
     with left:
         with st.container(border=True):
             st.markdown("**Monthly token breakdown**")
-            usage_donut(summary)
+            if usage_error:
+                st.caption("Usage chart unavailable.")
+            else:
+                usage_donut(summary)
     with right:
         with st.container(border=True):
             st.markdown("**Last 30 days**")
-            usage_daily_chart(thirty)
+            if usage_error:
+                st.caption("Usage chart unavailable.")
+            else:
+                usage_daily_chart(thirty)
+    if usage_error:
+        st.info("Try refreshing this page. If the problem continues, check the app logs for the Supabase status code.")
+        return
     section("Your usage details")
     with st.container(border=True):
         st.markdown(f"**Input tokens:** {format_tokens(summary['input'])}")
@@ -2075,15 +2109,19 @@ if "connect_links" not in st.session_state:
 active_connections, accounts_by_toolkit, connection_errors = load_connection_state()
 page = render_sidebar(user, active_connections)
 
+usage_rows = []
+usage_error = None
 if page in ("Overview", "Usage"):
     try:
         usage_rows = fetch_usage_rows()
-    except RuntimeError:
-        st.error("Usage data is temporarily unavailable. Please check that your Supabase access is configured.")
-        st.stop()
+    except RuntimeError as error:
+        usage_error = str(error)
+        # Avoid showing raw API responses to customers, but preserve diagnostic
+        # information in server logs (no API keys or access tokens logged).
+        LOGGER.warning("Supabase usage read failed: %s", error)
 
 if page == "Overview":
-    render_overview(user, active_connections, connection_errors, usage_rows)
+    render_overview(user, active_connections, connection_errors, usage_rows, usage_error)
 elif page == "AI Chat":
     render_ai_chat(active_connections)
 elif page == "My Tasks":
@@ -2091,6 +2129,6 @@ elif page == "My Tasks":
 elif page == "Integrations":
     render_integrations(accounts_by_toolkit, active_connections, connection_errors)
 elif page == "Usage":
-    render_usage(usage_rows)
+    render_usage(usage_rows, usage_error)
 elif page == "Settings":
     render_settings(user)
