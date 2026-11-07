@@ -1,10 +1,10 @@
-// AI Employee V7.4.1 - User-selected GA4 reporting periods + Gmail/Slack delivery
+// AI Employee V7.4.2 - Safe delivery: no retroactive or automatic backlog sending
 // One run per invocation; no schedules are created by this file.
 // Auth: Supabase secret key on apikey (verify_jwt disabled for this function).
 // Uses the existing V6 credit reservation, metering and settlement functions.
 import { withSupabase } from "npm:@supabase/server@1";
 
-const WORKER_VERSION = "7.4.1";
+const WORKER_VERSION = "7.4.2";
 const MODEL = "gemini-3.5-flash-lite";
 const MODEL_PRICING = "gemini-3.5-flash-lite-standard-2026-11-07";
 const COMPOSIO_BASE = "https://backend.composio.dev/api/v3.1";
@@ -734,23 +734,15 @@ async function deliverCompletedRun(db:Db, runId:string, retryFailed=false):Promi
   return outcome;
 }
 
-async function processPendingDelivery(db:Db):Promise<string>{
-  // Recover a successful report if the worker stopped after completing the
-  // GA4 execution but before attempting delivery.
-  const {data:runs,error}=await db.from("task_runs")
-    .select("id,task_id").eq("status","success")
-    .eq("delivery_status","not_requested")
-    .order("finished_at",{ascending:true}).limit(30);
-  if(error)throw new WorkerError("Cannot load pending deliveries.",true);
-  for(const item of runs??[]){
-    const {data:task,error:taskError}=await db.from("tasks")
-      .select("delivery_type").eq("id",item.task_id).maybeSingle();
-    if(taskError)throw new WorkerError("Cannot inspect pending report.",true);
-    if(task&&["email","slack"].includes(String(task.delivery_type)))
-      return await deliverCompletedRun(db,String(item.id));
-  }
-  return "idle";
-}
+// Intentionally no automatic delivery backlog scan:
+// Prior successful runs may have been created before email/Slack delivery was
+// selected. Sending them to the task's *current* destination would be
+// retroactive and could expose reports to an unintended recipient.
+// A fresh successful run sends only through processOne, directly after its
+// report has been saved. Failed deliveries can still be retried explicitly,
+// without re-running the AI, via the existing retry_delivery action.
+// If the worker stops between report completion and sending, that run remains
+// undelivered; never silently resend it without an explicit user action.
 
 async function processOne(db:Db, specificRunId?:string):Promise<Response> {
   const workerId="edge-v7-"+crypto.randomUUID().slice(0,12);
@@ -867,12 +859,10 @@ export default {
         const queued=await rpc(ctx.supabaseAdmin,"v7_enqueue_due_runs",{p_limit:10});
         const result=await processOne(ctx.supabaseAdmin);
         const outcome=await result.json();
-        // One extra delivery recovery per tick; no GA4 re-analysis/credit charge.
-        let recoveredDelivery="idle";
-        try{recoveredDelivery=await processPendingDelivery(ctx.supabaseAdmin);}
-        catch(error){console.warn("Pending delivery scan failed",safeError(error));}
+        // The Cron executes new work only. Do not auto-send reports from old runs
+        // or reinterpret their delivery destination using mutable task settings.
         return Response.json({status:"tick_processed",newly_queued:queued,
-          recovered,outcome,recovered_delivery:recoveredDelivery});
+          recovered,outcome,recovered_delivery:"disabled"});
       }catch(error){
         console.error("Scheduled worker tick failed",safeError(error));
         return Response.json({status:"scheduler_error",message:safeError(error)},{status:503});
